@@ -1,0 +1,51 @@
+{
+  "name": "clara-wallet",
+  "version": "0.1.0",
+  "description": "Your wallet inside Claude Code - powered by Para MPC",
+  "type": "module",
+  "main": "build/index.js",
+  "bin": {
+    "clara-wallet": "./build/index.js"
+  },
+  "scripts": {
+    "build": "tsc && chmod 755 build/index.js",
+    "dev": "tsc --watch",
+    "start": "node build/index.js",
+    "clean": "rm -rf build",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "wallet",
+    "para",
+    "clara",
+    "web3",
+    "ethereum",
+    "solana",
+    "mpc"
+  ],
+  "author": "Brian Flynn",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bflynn4141/clara"
+  },
+  "homepage": "https://github.com/bflynn4141/clara",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "build",
+    "README.md"
+  ],
+  "dependencies": {
+    "@getpara/server-sdk": "2.6.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}

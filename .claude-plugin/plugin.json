@@ -1,0 +1,11 @@
+{
+  "name": "para-wallet",
+  "version": "0.1.0",
+  "description": "Universal wallet for Claude Code plugins - create, sign, and transact across EVM and Solana chains",
+  "author": "Brian Flynn",
+  "repository": "https://github.com/bflynn/para-wallet",
+  "keywords": ["wallet", "web3", "para", "ethereum", "solana", "signing"],
+  "mcp": {
+    "server": "./build/index.js"
+  }
+}
