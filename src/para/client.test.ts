@@ -23,6 +23,7 @@ import {
   getWalletAddress,
   getBalances,
   signMessage,
+  simulateTransaction,
   CHAIN_CONFIG,
 } from './client.js';
 import { getSession, updateSession } from '../storage/session.js';
@@ -343,6 +344,178 @@ describe('Para REST API Client', () => {
 
     it('should not have chainId for Solana', () => {
       expect(CHAIN_CONFIG.solana.chainId).toBeUndefined();
+    });
+  });
+
+  describe('simulateTransaction', () => {
+    beforeEach(() => {
+      vi.mocked(getSession).mockResolvedValue({
+        authenticated: true,
+        address: '0xTestAddress1234567890abcdef1234567890ab',
+        walletId: 'wallet-evm-123',
+        solanaWalletId: 'wallet-sol-456',
+        solanaAddress: 'SolanaTestAddress123',
+        chains: [],
+        createdAt: new Date().toISOString(),
+        lastActiveAt: new Date().toISOString(),
+      });
+    });
+
+    it('should simulate a simple ETH transfer', async () => {
+      // Mock eth_call (simulation) - success
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ result: '0x' }),
+        })
+        // Mock eth_estimateGas
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ result: '0x5208' }), // 21000 gas
+        })
+        // Mock CoinGecko price fetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            ethereum: { usd: 2500, usd_24h_change: 1.5 },
+          }),
+        });
+
+      const result = await simulateTransaction(
+        {
+          to: '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045',
+          value: '1000000000000000000', // 1 ETH
+        },
+        'ethereum'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.action).toBe('Native Transfer');
+      expect(result.description).toContain('Send');
+      // 1 ETH is exactly at threshold, so no warning (warning is for > 1 ETH)
+      expect(result.gasEstimate).toBeDefined();
+    });
+
+    it('should detect unlimited token approval', async () => {
+      // Unlimited approval calldata
+      const unlimitedApproval = '0x095ea7b3' +
+        '0000000000000000000000007a250d5630b4cf539739df2c5dacb4c659f2488d' +
+        'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
+
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ result: '0x' }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ result: '0xea60' }), // 60000 gas
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            ethereum: { usd: 2500, usd_24h_change: 1.5 },
+          }),
+        });
+
+      const result = await simulateTransaction(
+        {
+          to: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', // USDC
+          data: unlimitedApproval,
+        },
+        'ethereum'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.action).toBe('approve');
+      expect(result.warnings).toContainEqual(
+        expect.stringContaining('UNLIMITED APPROVAL')
+      );
+    });
+
+    it('should detect known contracts', async () => {
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ result: '0x' }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ result: '0x5208' }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            ethereum: { usd: 2500, usd_24h_change: 1.5 },
+          }),
+        });
+
+      const result = await simulateTransaction(
+        {
+          to: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', // WETH
+          value: '1000000000000000000',
+        },
+        'ethereum'
+      );
+
+      expect(result.details.contract).toBe('WETH');
+    });
+
+    it('should handle simulation failure (revert)', async () => {
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            error: { message: 'execution reverted: insufficient balance' },
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ result: '0x5208' }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            ethereum: { usd: 2500, usd_24h_change: 1.5 },
+          }),
+        });
+
+      const result = await simulateTransaction(
+        {
+          to: '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045',
+          value: '1000000000000000000000000', // Way too much ETH
+        },
+        'ethereum'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.warnings).toContainEqual(
+        expect.stringContaining('REVERT')
+      );
+    });
+
+    it('should throw if not authenticated', async () => {
+      vi.mocked(getSession).mockResolvedValue(null);
+
+      await expect(
+        simulateTransaction({ to: '0x123' }, 'ethereum')
+      ).rejects.toThrow('Not authenticated');
+    });
+
+    it('should handle Solana transactions with limited simulation', async () => {
+      const result = await simulateTransaction(
+        {
+          to: 'SomeSOLAddress',
+          value: '1000000000', // 1 SOL in lamports
+        },
+        'solana'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.action).toBe('Solana Transaction');
+      expect(result.warnings).toContainEqual(
+        expect.stringContaining('Solana simulation limited')
+      );
     });
   });
 });

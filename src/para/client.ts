@@ -12,6 +12,18 @@
 
 import { getSession, updateSession } from "../storage/session.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
+import {
+  recordYieldTransaction,
+  getTransactionsForPosition,
+  calculateEarnings,
+  getYieldEarningsSummary,
+  type YieldTransaction,
+} from "../storage/yield-history.js";
+import {
+  getProtocolAdapter,
+  getSupportedProtocols,
+  type ProtocolAdapter,
+} from "./protocols/index.js";
 
 // Types
 export interface TokenBalance {
@@ -52,6 +64,31 @@ const CHAIN_CONFIG: Record<SupportedChain, { name: string; chainId?: number; rpc
   optimism: { name: "Optimism", chainId: 10, rpcUrl: "https://mainnet.optimism.io" },
   polygon: { name: "Polygon", chainId: 137, rpcUrl: "https://polygon-rpc.com" },
   solana: { name: "Solana", rpcUrl: "https://api.mainnet-beta.solana.com" },
+};
+
+// Block explorer API configuration (for transaction history)
+const EXPLORER_CONFIG: Record<SupportedChain, { apiUrl: string; explorerUrl: string } | null> = {
+  ethereum: {
+    apiUrl: "https://api.etherscan.io/api",
+    explorerUrl: "https://etherscan.io",
+  },
+  base: {
+    apiUrl: "https://api.basescan.org/api",
+    explorerUrl: "https://basescan.org",
+  },
+  arbitrum: {
+    apiUrl: "https://api.arbiscan.io/api",
+    explorerUrl: "https://arbiscan.io",
+  },
+  optimism: {
+    apiUrl: "https://api-optimistic.etherscan.io/api",
+    explorerUrl: "https://optimistic.etherscan.io",
+  },
+  polygon: {
+    apiUrl: "https://api.polygonscan.com/api",
+    explorerUrl: "https://polygonscan.com",
+  },
+  solana: null, // Solana uses different explorer APIs
 };
 
 // Para API configuration
@@ -520,7 +557,7 @@ export async function getWalletAddress(chain: SupportedChain): Promise<string> {
 }
 
 /**
- * Get token balances for a chain
+ * Get token balances for a chain (legacy - native token only)
  */
 export async function getBalances(
   chain: SupportedChain,
@@ -600,6 +637,405 @@ export async function getBalances(
       },
     ];
   }
+}
+
+// ============================================================================
+// Multicall3 - Efficient Batch Balance Fetching
+// ============================================================================
+
+/**
+ * Multicall3 contract address (same on all EVM chains)
+ * https://www.multicall3.com/
+ */
+const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
+
+/**
+ * Multicall3 function selectors
+ */
+const MULTICALL3_SELECTORS = {
+  // aggregate3(Call3[]) - returns Result[]
+  aggregate3: "0x82ad56cb",
+  // getEthBalance(address) - returns uint256
+  getEthBalance: "0x4d2301cc",
+};
+
+/**
+ * Extended balance result with all tokens
+ */
+export interface MultiTokenBalance {
+  symbol: string;
+  balance: string;
+  balanceRaw: string;
+  decimals: number;
+  contractAddress?: string;
+  usdValue?: number;
+}
+
+/**
+ * Fetch ALL token balances for a chain in a single RPC call using Multicall3
+ *
+ * This is much more efficient than making separate calls for each token:
+ * - Before: 1 call per token (5+ RPC calls)
+ * - After: 1 RPC call total (via Multicall3 batching)
+ */
+export async function getAllBalancesMulticall(
+  chain: SupportedChain
+): Promise<MultiTokenBalance[]> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  if (chain === "solana") {
+    // Solana doesn't have Multicall3 - use legacy method
+    const balances = await getBalances("solana");
+    return balances.map(b => ({
+      symbol: b.symbol,
+      balance: b.balance,
+      balanceRaw: "0",
+      decimals: 9,
+    }));
+  }
+
+  const config = CHAIN_CONFIG[chain];
+  const userAddress = session.address.slice(2).toLowerCase().padStart(64, "0");
+
+  console.error(`[clara] Fetching all balances for ${chain} via Multicall3`);
+
+  // Build the list of tokens to check
+  const tokensToCheck: Array<{
+    symbol: string;
+    address: string;
+    decimals: number;
+  }> = [];
+
+  for (const [symbol, chainData] of Object.entries(POPULAR_TOKENS)) {
+    const tokenInfo = chainData[chain];
+    if (tokenInfo) {
+      tokensToCheck.push({
+        symbol,
+        address: tokenInfo.address,
+        decimals: tokenInfo.decimals,
+      });
+    }
+  }
+
+  // Build Multicall3 calls array
+  // Each call: { target, allowFailure, callData }
+  // We encode this as: target (address) + allowFailure (bool) + callData (bytes)
+
+  const calls: Array<{ target: string; allowFailure: boolean; callData: string }> = [];
+
+  // First call: get native ETH balance via Multicall3.getEthBalance(address)
+  calls.push({
+    target: MULTICALL3_ADDRESS,
+    allowFailure: true,
+    callData: MULTICALL3_SELECTORS.getEthBalance + userAddress,
+  });
+
+  // Add balanceOf calls for each token
+  for (const token of tokensToCheck) {
+    calls.push({
+      target: token.address,
+      allowFailure: true,
+      callData: ERC20_SELECTORS.balanceOf + userAddress,
+    });
+  }
+
+  // Encode aggregate3 call
+  // aggregate3(Call3[] calldata calls)
+  // Call3 = (address target, bool allowFailure, bytes callData)
+  const encodedCalls = encodeMulticallAggregate3(calls);
+
+  try {
+    const response = await fetch(config.rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "eth_call",
+        params: [
+          {
+            to: MULTICALL3_ADDRESS,
+            data: encodedCalls,
+          },
+          "latest",
+        ],
+        id: 1,
+      }),
+    });
+
+    const rpcResult = (await response.json()) as { result?: string; error?: { message: string } };
+
+    if (rpcResult.error || !rpcResult.result) {
+      console.error(`[clara] Multicall3 failed:`, rpcResult.error);
+      // Fallback to individual calls
+      return await getAllBalancesFallback(chain, tokensToCheck);
+    }
+
+    // Decode the results
+    const results = decodeMulticallResults(rpcResult.result, calls.length);
+    const balances: MultiTokenBalance[] = [];
+
+    // First result is native ETH balance
+    const nativeSymbol = chain === "polygon" ? "MATIC" : "ETH";
+    if (results[0].success && results[0].data.length >= 66) {
+      const balanceRaw = BigInt(results[0].data);
+      const balance = Number(balanceRaw) / 1e18;
+      if (balance > 0) {
+        balances.push({
+          symbol: nativeSymbol,
+          balance: balance.toFixed(6),
+          balanceRaw: balanceRaw.toString(),
+          decimals: 18,
+        });
+      }
+    }
+
+    // Rest are token balances
+    for (let i = 0; i < tokensToCheck.length; i++) {
+      const result = results[i + 1]; // +1 because first is native
+      const token = tokensToCheck[i];
+
+      if (result.success && result.data.length >= 66) {
+        const balanceRaw = BigInt(result.data);
+        const balance = Number(balanceRaw) / Math.pow(10, token.decimals);
+
+        if (balance > 0) {
+          balances.push({
+            symbol: token.symbol,
+            balance: balance.toFixed(token.decimals > 6 ? 6 : token.decimals),
+            balanceRaw: balanceRaw.toString(),
+            decimals: token.decimals,
+            contractAddress: token.address,
+          });
+        }
+      }
+    }
+
+    console.error(`[clara] Found ${balances.length} non-zero balances on ${chain}`);
+    return balances;
+  } catch (error) {
+    console.error(`[clara] Multicall3 error:`, error);
+    return await getAllBalancesFallback(chain, tokensToCheck);
+  }
+}
+
+/**
+ * Encode aggregate3 call data for Multicall3
+ */
+function encodeMulticallAggregate3(
+  calls: Array<{ target: string; allowFailure: boolean; callData: string }>
+): string {
+  // aggregate3(Call3[] calldata calls)
+  // Call3 = (address target, bool allowFailure, bytes callData)
+
+  // Function selector
+  let encoded = MULTICALL3_SELECTORS.aggregate3;
+
+  // Offset to array data (32 bytes)
+  encoded += "0000000000000000000000000000000000000000000000000000000000000020";
+
+  // Array length
+  encoded += calls.length.toString(16).padStart(64, "0");
+
+  // Calculate offsets for each call's dynamic data
+  // Each Call3 has: address (32) + bool (32) + bytes offset (32) = 96 bytes fixed
+  // Plus variable bytes data
+
+  let dataOffset = calls.length * 96; // Starting offset for bytes data
+  const dynamicParts: string[] = [];
+
+  for (const call of calls) {
+    // target address (padded to 32 bytes)
+    encoded += call.target.slice(2).toLowerCase().padStart(64, "0");
+
+    // allowFailure bool
+    encoded += call.allowFailure ? "0000000000000000000000000000000000000000000000000000000000000001" : "0000000000000000000000000000000000000000000000000000000000000000";
+
+    // Offset to callData
+    encoded += dataOffset.toString(16).padStart(64, "0");
+
+    // Calculate this call's data size (32 for length + padded data)
+    const callDataNoPrefix = call.callData.startsWith("0x") ? call.callData.slice(2) : call.callData;
+    const dataLength = callDataNoPrefix.length / 2;
+    const paddedDataLength = Math.ceil(dataLength / 32) * 32;
+
+    // Length of callData
+    dynamicParts.push(dataLength.toString(16).padStart(64, "0"));
+    // Actual callData (padded to 32 bytes)
+    dynamicParts.push(callDataNoPrefix.padEnd(paddedDataLength * 2, "0"));
+
+    dataOffset += 32 + paddedDataLength; // 32 for length + padded data
+  }
+
+  // Append all dynamic data
+  encoded += dynamicParts.join("");
+
+  return "0x" + encoded.slice(2); // Ensure single 0x prefix
+}
+
+/**
+ * Decode Multicall3 aggregate3 results
+ */
+function decodeMulticallResults(
+  data: string,
+  numCalls: number
+): Array<{ success: boolean; data: string }> {
+  const results: Array<{ success: boolean; data: string }> = [];
+
+  // Remove 0x prefix
+  const hex = data.startsWith("0x") ? data.slice(2) : data;
+
+  // First 32 bytes: offset to array
+  // Next 32 bytes: array length
+  // Then for each result: success (32 bytes) + offset to returnData (32 bytes)
+  // Then the actual return data
+
+  try {
+    const arrayOffset = parseInt(hex.slice(0, 64), 16) * 2;
+    const arrayLength = parseInt(hex.slice(arrayOffset, arrayOffset + 64), 16);
+
+    // Parse each result
+    let pos = arrayOffset + 64;
+    const resultOffsets: number[] = [];
+
+    for (let i = 0; i < arrayLength; i++) {
+      const resultOffset = parseInt(hex.slice(pos, pos + 64), 16) * 2;
+      resultOffsets.push(arrayOffset + 64 + resultOffset);
+      pos += 64;
+    }
+
+    for (const offset of resultOffsets) {
+      const success = parseInt(hex.slice(offset, offset + 64), 16) === 1;
+      const dataOffset = parseInt(hex.slice(offset + 64, offset + 128), 16) * 2;
+      const dataLength = parseInt(hex.slice(offset + 64 + dataOffset, offset + 64 + dataOffset + 64), 16);
+      const returnData = "0x" + hex.slice(offset + 64 + dataOffset + 64, offset + 64 + dataOffset + 64 + dataLength * 2);
+
+      results.push({ success, data: returnData });
+    }
+  } catch (error) {
+    console.error("[clara] Error decoding multicall results:", error);
+    // Return empty results on decode error
+    for (let i = 0; i < numCalls; i++) {
+      results.push({ success: false, data: "0x" });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Fallback: fetch balances one by one (slower but more reliable)
+ */
+async function getAllBalancesFallback(
+  chain: SupportedChain,
+  tokens: Array<{ symbol: string; address: string; decimals: number }>
+): Promise<MultiTokenBalance[]> {
+  console.error(`[clara] Using fallback balance fetch for ${chain}`);
+
+  const balances: MultiTokenBalance[] = [];
+
+  // Get native balance
+  const nativeResult = await getNativeBalance(chain);
+  if (parseFloat(nativeResult.balance) > 0) {
+    balances.push({
+      symbol: nativeResult.symbol,
+      balance: nativeResult.balance,
+      balanceRaw: nativeResult.balanceRaw.toString(),
+      decimals: 18,
+    });
+  }
+
+  // Get each token balance
+  for (const token of tokens) {
+    try {
+      const result = await getTokenBalance(token.address, chain);
+      if (parseFloat(result.balance) > 0) {
+        balances.push({
+          symbol: token.symbol,
+          balance: result.balance,
+          balanceRaw: result.balanceRaw,
+          decimals: token.decimals,
+          contractAddress: token.address,
+        });
+      }
+    } catch {
+      // Skip tokens that fail
+    }
+  }
+
+  return balances;
+}
+
+/**
+ * Get complete portfolio using Multicall3 for efficiency
+ * Single RPC call per chain instead of many
+ */
+export async function getPortfolioFast(): Promise<Portfolio> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  console.error("[clara] Building portfolio via Multicall3...");
+
+  // Fetch prices
+  const prices = await fetchPrices();
+  const ethPrice = prices["ethereum"]?.usd || 0;
+  const maticPrice = prices["matic-network"]?.usd || 0;
+
+  // Get balances for all chains in parallel using Multicall3
+  const evmChains: SupportedChain[] = ["base", "arbitrum", "optimism", "ethereum", "polygon"];
+
+  const chainBalances = await Promise.all(
+    evmChains.map(async (chain) => {
+      try {
+        return { chain, balances: await getAllBalancesMulticall(chain) };
+      } catch {
+        return { chain, balances: [] };
+      }
+    })
+  );
+
+  // Build portfolio items
+  const items: PortfolioItem[] = [];
+  let totalValueUsd = 0;
+
+  for (const { chain, balances } of chainBalances) {
+    for (const bal of balances) {
+      const balanceNum = parseFloat(bal.balance);
+
+      // Calculate USD value
+      let priceUsd: number | null = null;
+      if (bal.symbol === "ETH" || bal.symbol === "WETH") {
+        priceUsd = ethPrice;
+      } else if (bal.symbol === "MATIC") {
+        priceUsd = maticPrice;
+      } else if (STABLE_TOKENS.has(bal.symbol)) {
+        priceUsd = 1.0;
+      }
+
+      const valueUsd = priceUsd ? balanceNum * priceUsd : null;
+      if (valueUsd) totalValueUsd += valueUsd;
+
+      items.push({
+        chain,
+        symbol: bal.symbol,
+        balance: bal.balance,
+        priceUsd,
+        valueUsd,
+        change24h: bal.symbol === "ETH" ? prices["ethereum"]?.usd_24h_change || null : null,
+      });
+    }
+  }
+
+  return {
+    items,
+    totalValueUsd,
+    totalChange24h: prices["ethereum"]?.usd_24h_change || null,
+    lastUpdated: new Date().toISOString(),
+  };
 }
 
 /**
@@ -752,12 +1188,16 @@ export async function signTransaction(
 
 /**
  * Send tokens (sign + broadcast)
+ *
+ * For native tokens: sendTransaction(to, amount, chain)
+ * For ERC-20 tokens: sendTransaction(tokenContract, "0", chain, undefined, transferData)
  */
 export async function sendTransaction(
   to: string,
   amount: string,
   chain: SupportedChain,
-  _tokenAddress?: string
+  _tokenAddress?: string,
+  data?: string  // ERC-20 transfer calldata
 ): Promise<{
   txHash: string;
   signature?: string;
@@ -768,7 +1208,8 @@ export async function sendTransaction(
     throw new Error("Not authenticated");
   }
 
-  console.error(`[clara] Sending ${amount} to ${to} on ${chain}`);
+  const isTokenTransfer = data && data.startsWith("0xa9059cbb");
+  console.error(`[clara] Sending ${isTokenTransfer ? "token transfer" : amount} to ${to} on ${chain}`);
 
   const config = CHAIN_CONFIG[chain];
 
@@ -793,6 +1234,7 @@ export async function sendTransaction(
       {
         to,
         value: amountWei.toString(),
+        data: data || "0x",  // Include ERC-20 calldata if provided
         chainId: config.chainId,
       },
       chain
@@ -810,16 +1252,16 @@ export async function sendTransaction(
       }),
     });
 
-    const data = (await response.json()) as {
+    const rpcResult = (await response.json()) as {
       result?: string;
       error?: { message: string };
     };
 
-    if (data.error) {
-      throw new Error(data.error.message);
+    if (rpcResult.error) {
+      throw new Error(rpcResult.error.message);
     }
 
-    return { txHash: data.result || signed.txHash || "" };
+    return { txHash: rpcResult.result || signed.txHash || "" };
   } catch (error) {
     console.error("[clara] Send error:", error);
     throw error;
@@ -980,6 +1422,104 @@ export async function fetchPrices(): Promise<Record<string, { usd: number; usd_2
 }
 
 /**
+ * Token price mapping for yield position valuation
+ * Stablecoins are assumed to be $1 (more reliable than API for DeFi calculations)
+ * Non-stables fetch from CoinGecko
+ */
+const STABLE_TOKENS = new Set(["USDC", "USDT", "DAI", "USDbC", "USDC.e", "FRAX", "LUSD", "sUSD"]);
+
+// CoinGecko token IDs for non-stablecoin yield assets
+const TOKEN_COINGECKO_IDS: Record<string, string> = {
+  WETH: "ethereum",
+  ETH: "ethereum",
+  WBTC: "wrapped-bitcoin",
+  wstETH: "wrapped-steth",
+  cbETH: "coinbase-wrapped-staked-eth",
+  rETH: "rocket-pool-eth",
+};
+
+/**
+ * Get USD price for a token
+ * Stablecoins return 1.0, others fetch from CoinGecko
+ */
+export async function getTokenPriceUsd(symbol: string): Promise<number | null> {
+  // Stablecoins are ~$1
+  if (STABLE_TOKENS.has(symbol)) {
+    return 1.0;
+  }
+
+  // Check if we have a CoinGecko ID for this token
+  const geckoId = TOKEN_COINGECKO_IDS[symbol];
+  if (!geckoId) {
+    console.error(`[clara] No price source for ${symbol}`);
+    return null;
+  }
+
+  try {
+    const response = await fetch(
+      `${COINGECKO_API}/simple/price?ids=${geckoId}&vs_currencies=usd`,
+      { headers: { "Accept": "application/json" } }
+    );
+
+    if (!response.ok) {
+      console.error(`[clara] Price fetch error for ${symbol}: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json() as Record<string, { usd: number }>;
+    return data[geckoId]?.usd ?? null;
+  } catch (error) {
+    console.error(`[clara] Price fetch error for ${symbol}:`, error);
+    return null;
+  }
+}
+
+/**
+ * Batch fetch prices for multiple tokens (efficient for portfolio)
+ */
+export async function getTokenPricesUsd(symbols: string[]): Promise<Record<string, number>> {
+  const prices: Record<string, number> = {};
+
+  // Handle stablecoins first (no API call needed)
+  for (const symbol of symbols) {
+    if (STABLE_TOKENS.has(symbol)) {
+      prices[symbol] = 1.0;
+    }
+  }
+
+  // Collect non-stables that need API fetch
+  const nonStables = symbols.filter(s => !STABLE_TOKENS.has(s));
+  const geckoIds = nonStables
+    .map(s => TOKEN_COINGECKO_IDS[s])
+    .filter(Boolean);
+
+  if (geckoIds.length === 0) {
+    return prices;
+  }
+
+  try {
+    const response = await fetch(
+      `${COINGECKO_API}/simple/price?ids=${[...new Set(geckoIds)].join(",")}&vs_currencies=usd`,
+      { headers: { "Accept": "application/json" } }
+    );
+
+    if (response.ok) {
+      const data = await response.json() as Record<string, { usd: number }>;
+      for (const symbol of nonStables) {
+        const geckoId = TOKEN_COINGECKO_IDS[symbol];
+        if (geckoId && data[geckoId]) {
+          prices[symbol] = data[geckoId].usd;
+        }
+      }
+    }
+  } catch (error) {
+    console.error("[clara] Batch price fetch error:", error);
+  }
+
+  return prices;
+}
+
+/**
  * Get portfolio across all chains
  * Fetches balances and current prices, calculates USD values
  */
@@ -1080,4 +1620,2919 @@ export function formatChange(change: number | null | undefined): string {
   return `${sign}${change.toFixed(2)}%`;
 }
 
-export { CHAIN_CONFIG };
+// Extended function signature database for transaction decoding
+const FUNCTION_SIGNATURES: Record<string, { name: string; description: string; risk?: string }> = {
+  // ERC-20
+  "0xa9059cbb": { name: "transfer", description: "Transfer tokens to address" },
+  "0x095ea7b3": { name: "approve", description: "Approve spending allowance", risk: "Check approval amount" },
+  "0x23b872dd": { name: "transferFrom", description: "Transfer tokens from another address" },
+
+  // ERC-721 (NFTs)
+  "0x42842e0e": { name: "safeTransferFrom", description: "Transfer NFT safely" },
+  "0xb88d4fde": { name: "safeTransferFrom", description: "Transfer NFT with data" },
+  "0xa22cb465": { name: "setApprovalForAll", description: "Approve all NFTs for operator", risk: "Grants full NFT access" },
+
+  // Uniswap V2/V3
+  "0x7ff36ab5": { name: "swapExactETHForTokens", description: "Swap ETH for tokens" },
+  "0x38ed1739": { name: "swapExactTokensForTokens", description: "Swap tokens for tokens" },
+  "0x18cbafe5": { name: "swapExactTokensForETH", description: "Swap tokens for ETH" },
+  "0xfb3bdb41": { name: "swapETHForExactTokens", description: "Swap ETH for exact token amount" },
+  "0x5ae401dc": { name: "multicall", description: "Uniswap V3 multicall (multiple operations)" },
+  "0xac9650d8": { name: "multicall", description: "Multicall (batched operations)" },
+  "0x04e45aaf": { name: "exactInputSingle", description: "Uniswap V3 single swap" },
+
+  // Aave
+  "0xe8eda9df": { name: "deposit", description: "Deposit to Aave lending pool" },
+  "0x69328dec": { name: "withdraw", description: "Withdraw from Aave lending pool" },
+  "0xa415bcad": { name: "borrow", description: "Borrow from Aave", risk: "Creates debt position" },
+  "0x573ade81": { name: "repay", description: "Repay Aave loan" },
+
+  // Compound
+  "0xa0712d68": { name: "mint", description: "Supply to Compound" },
+  "0xdb006a75": { name: "redeem", description: "Withdraw from Compound" },
+  "0xc5ebeaec": { name: "borrow", description: "Borrow from Compound", risk: "Creates debt position" },
+
+  // ENS
+  "0x77372213": { name: "setText", description: "Set ENS text record" },
+  "0x8b95dd71": { name: "setAddr", description: "Set ENS address" },
+  "0xf14fcbc8": { name: "commit", description: "ENS name commitment" },
+  "0x85f6d155": { name: "register", description: "Register ENS name" },
+
+  // Common
+  "0x2e1a7d4d": { name: "withdraw", description: "Withdraw (e.g., WETH unwrap)" },
+  "0xd0e30db0": { name: "deposit", description: "Deposit (e.g., WETH wrap)" },
+  "0x3593564c": { name: "execute", description: "Universal Router execute (Uniswap)" },
+
+  // Dangerous
+  "0x00000000": { name: "unknown", description: "Unknown function", risk: "Unverified function call" },
+};
+
+// Known contract addresses for context
+const KNOWN_CONTRACTS: Record<string, { name: string; type: string }> = {
+  // Mainnet
+  "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": { name: "WETH", type: "token" },
+  "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": { name: "USDC", type: "token" },
+  "0xdac17f958d2ee523a2206206994597c13d831ec7": { name: "USDT", type: "token" },
+  "0x6b175474e89094c44da98b954eedeac495271d0f": { name: "DAI", type: "token" },
+  "0x7a250d5630b4cf539739df2c5dacb4c659f2488d": { name: "Uniswap V2 Router", type: "dex" },
+  "0xe592427a0aece92de3edee1f18e0157c05861564": { name: "Uniswap V3 Router", type: "dex" },
+  "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45": { name: "Uniswap Universal Router", type: "dex" },
+  "0x7d2768de32b0b80b7a3454c06bdac94a69ddc7a9": { name: "Aave V2 Pool", type: "lending" },
+  "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2": { name: "Aave V3 Pool", type: "lending" },
+
+  // Base
+  "0x4200000000000000000000000000000000000006": { name: "WETH (Base)", type: "token" },
+  "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": { name: "USDC (Base)", type: "token" },
+  "0x2626664c2603336e57b271c5c0b26f421741e481": { name: "Uniswap V3 Router (Base)", type: "dex" },
+};
+
+// ============================================================================
+// ERC-20 Token Support
+// ============================================================================
+
+/**
+ * Popular tokens database with addresses across chains
+ * Tokens are keyed by symbol, with chain-specific addresses
+ */
+export const POPULAR_TOKENS: Record<string, Record<SupportedChain, { address: string; decimals: number } | null>> = {
+  USDC: {
+    ethereum: { address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", decimals: 6 },
+    base: { address: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", decimals: 6 },
+    arbitrum: { address: "0xaf88d065e77c8cc2239327c5edb3a432268e5831", decimals: 6 },
+    optimism: { address: "0x0b2c639c533813f4aa9d7837caf62653d097ff85", decimals: 6 },
+    polygon: { address: "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359", decimals: 6 },
+    solana: null, // SPL tokens not yet supported
+  },
+  USDT: {
+    ethereum: { address: "0xdac17f958d2ee523a2206206994597c13d831ec7", decimals: 6 },
+    base: null,
+    arbitrum: { address: "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9", decimals: 6 },
+    optimism: { address: "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58", decimals: 6 },
+    polygon: { address: "0xc2132d05d31c914a87c6611c10748aeb04b58e8f", decimals: 6 },
+    solana: null,
+  },
+  DAI: {
+    ethereum: { address: "0x6b175474e89094c44da98b954eedeac495271d0f", decimals: 18 },
+    base: { address: "0x50c5725949a6f0c72e6c4a641f24049a917db0cb", decimals: 18 },
+    arbitrum: { address: "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1", decimals: 18 },
+    optimism: { address: "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1", decimals: 18 },
+    polygon: { address: "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063", decimals: 18 },
+    solana: null,
+  },
+  WETH: {
+    ethereum: { address: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", decimals: 18 },
+    base: { address: "0x4200000000000000000000000000000000000006", decimals: 18 },
+    arbitrum: { address: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1", decimals: 18 },
+    optimism: { address: "0x4200000000000000000000000000000000000006", decimals: 18 },
+    polygon: { address: "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619", decimals: 18 },
+    solana: null,
+  },
+  WBTC: {
+    ethereum: { address: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", decimals: 8 },
+    base: null,
+    arbitrum: { address: "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f", decimals: 8 },
+    optimism: { address: "0x68f180fcce6836688e9084f035309e29bf0a2095", decimals: 8 },
+    polygon: { address: "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6", decimals: 8 },
+    solana: null,
+  },
+};
+
+/**
+ * ERC-20 function selectors
+ */
+const ERC20_SELECTORS = {
+  balanceOf: "0x70a08231",    // balanceOf(address)
+  transfer: "0xa9059cbb",     // transfer(address,uint256)
+  approve: "0x095ea7b3",      // approve(address,uint256)
+  allowance: "0xdd62ed3e",    // allowance(address,address)
+  symbol: "0x95d89b41",       // symbol()
+  decimals: "0x313ce567",     // decimals()
+  name: "0x06fdde03",         // name()
+};
+
+/**
+ * Token metadata
+ */
+export interface TokenMetadata {
+  address: string;
+  symbol: string;
+  decimals: number;
+  name?: string;
+}
+
+/**
+ * Fetch ERC-20 token metadata from the blockchain
+ * Falls back to POPULAR_TOKENS database if RPC calls fail
+ */
+export async function getTokenMetadata(
+  tokenAddress: string,
+  chain: SupportedChain
+): Promise<TokenMetadata> {
+  if (chain === "solana") {
+    throw new Error("SPL tokens not yet supported");
+  }
+
+  const config = CHAIN_CONFIG[chain];
+  const address = tokenAddress.toLowerCase();
+
+  // Check if it's a known token first (faster)
+  for (const [symbol, chainData] of Object.entries(POPULAR_TOKENS)) {
+    const tokenInfo = chainData[chain];
+    if (tokenInfo && tokenInfo.address.toLowerCase() === address) {
+      return {
+        address: tokenInfo.address,
+        symbol,
+        decimals: tokenInfo.decimals,
+      };
+    }
+  }
+
+  // Fetch from blockchain
+  console.error(`[clara] Fetching token metadata for ${tokenAddress} on ${chain}`);
+
+  try {
+    // Fetch symbol and decimals in parallel
+    const [symbolResult, decimalsResult] = await Promise.all([
+      fetch(config.rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "eth_call",
+          params: [{ to: tokenAddress, data: ERC20_SELECTORS.symbol }, "latest"],
+          id: 1,
+        }),
+      }),
+      fetch(config.rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "eth_call",
+          params: [{ to: tokenAddress, data: ERC20_SELECTORS.decimals }, "latest"],
+          id: 2,
+        }),
+      }),
+    ]);
+
+    const [symbolData, decimalsData] = await Promise.all([
+      symbolResult.json() as Promise<{ result?: string }>,
+      decimalsResult.json() as Promise<{ result?: string }>,
+    ]);
+
+    // Decode symbol (string type - skip first 64 chars for offset+length, then decode)
+    let symbol = "UNKNOWN";
+    if (symbolData.result && symbolData.result.length > 2) {
+      try {
+        // Try to decode as dynamic string
+        const hex = symbolData.result.slice(2);
+        if (hex.length >= 128) {
+          // Dynamic string: offset (32 bytes) + length (32 bytes) + data
+          const length = parseInt(hex.slice(64, 128), 16);
+          const strHex = hex.slice(128, 128 + length * 2);
+          symbol = Buffer.from(strHex, "hex").toString("utf8").replace(/\0/g, "");
+        } else if (hex.length === 64) {
+          // Fixed bytes32
+          symbol = Buffer.from(hex, "hex").toString("utf8").replace(/\0/g, "");
+        }
+      } catch {
+        symbol = "UNKNOWN";
+      }
+    }
+
+    // Decode decimals (uint8)
+    let decimals = 18;
+    if (decimalsData.result && decimalsData.result !== "0x") {
+      decimals = parseInt(decimalsData.result, 16);
+    }
+
+    return { address: tokenAddress, symbol, decimals };
+  } catch (error) {
+    console.error(`[clara] Failed to fetch token metadata:`, error);
+    // Return default if fetch fails
+    return { address: tokenAddress, symbol: "TOKEN", decimals: 18 };
+  }
+}
+
+/**
+ * Get ERC-20 token balance for an address
+ */
+export async function getTokenBalance(
+  tokenAddress: string,
+  chain: SupportedChain,
+  ownerAddress?: string
+): Promise<{ balance: string; balanceRaw: string; symbol: string; decimals: number }> {
+  if (chain === "solana") {
+    throw new Error("SPL tokens not yet supported");
+  }
+
+  const session = await getSession();
+  const owner = ownerAddress || session?.address;
+
+  if (!owner) {
+    throw new Error("No wallet address available");
+  }
+
+  const config = CHAIN_CONFIG[chain];
+
+  // Get token metadata
+  const metadata = await getTokenMetadata(tokenAddress, chain);
+
+  // Encode balanceOf(owner) call
+  const paddedAddress = owner.slice(2).toLowerCase().padStart(64, "0");
+  const calldata = ERC20_SELECTORS.balanceOf + paddedAddress;
+
+  console.error(`[clara] Fetching ${metadata.symbol} balance on ${chain}`);
+
+  try {
+    const response = await fetch(config.rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "eth_call",
+        params: [{ to: tokenAddress, data: calldata }, "latest"],
+        id: 1,
+      }),
+    });
+
+    const data = (await response.json()) as { result?: string };
+    const balanceRaw = data.result ? BigInt(data.result).toString() : "0";
+    const balanceNum = Number(BigInt(balanceRaw)) / Math.pow(10, metadata.decimals);
+
+    return {
+      balance: balanceNum.toFixed(metadata.decimals > 6 ? 6 : metadata.decimals),
+      balanceRaw,
+      symbol: metadata.symbol,
+      decimals: metadata.decimals,
+    };
+  } catch (error) {
+    console.error(`[clara] Token balance fetch error:`, error);
+    return {
+      balance: "0",
+      balanceRaw: "0",
+      symbol: metadata.symbol,
+      decimals: metadata.decimals,
+    };
+  }
+}
+
+/**
+ * Encode ERC-20 transfer calldata
+ * transfer(address to, uint256 amount)
+ */
+export function encodeERC20Transfer(to: string, amount: string, decimals: number): string {
+  // Pad address to 32 bytes
+  const paddedTo = to.slice(2).toLowerCase().padStart(64, "0");
+
+  // Convert amount to raw units and pad to 32 bytes
+  const amountFloat = parseFloat(amount);
+  const amountRaw = BigInt(Math.floor(amountFloat * Math.pow(10, decimals)));
+  const paddedAmount = amountRaw.toString(16).padStart(64, "0");
+
+  return ERC20_SELECTORS.transfer + paddedTo + paddedAmount;
+}
+
+/**
+ * Resolve a token symbol or address to token info for a chain
+ * Accepts: "USDC", "usdc", or "0xa0b86991..."
+ */
+export function resolveToken(
+  tokenInput: string,
+  chain: SupportedChain
+): { address: string; symbol: string; decimals: number } | null {
+  if (chain === "solana") {
+    return null;
+  }
+
+  // If it's an address, look it up
+  if (tokenInput.startsWith("0x")) {
+    const address = tokenInput.toLowerCase();
+    for (const [symbol, chainData] of Object.entries(POPULAR_TOKENS)) {
+      const tokenInfo = chainData[chain];
+      if (tokenInfo && tokenInfo.address.toLowerCase() === address) {
+        return { address: tokenInfo.address, symbol, decimals: tokenInfo.decimals };
+      }
+    }
+    // Return the address with unknown metadata (will be fetched later)
+    return null;
+  }
+
+  // It's a symbol - look up the address
+  const symbol = tokenInput.toUpperCase();
+  const tokenData = POPULAR_TOKENS[symbol];
+  if (tokenData) {
+    const chainInfo = tokenData[chain];
+    if (chainInfo) {
+      return { address: chainInfo.address, symbol, decimals: chainInfo.decimals };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Simulation result
+ */
+export interface SimulationResult {
+  success: boolean;
+  error?: string;
+  gasEstimate: string;
+  gasUsd: string;
+  action: string;
+  description: string;
+  warnings: string[];
+  details: {
+    from: string;
+    to: string;
+    value: string;
+    valueUsd: string;
+    function?: string;
+    contract?: string;
+  };
+}
+
+/**
+ * Simulate a transaction without executing it
+ * Uses eth_call to check if it would succeed and estimates gas
+ */
+export async function simulateTransaction(
+  tx: TransactionRequest,
+  chain: SupportedChain
+): Promise<SimulationResult> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  if (chain === "solana") {
+    return {
+      success: true,
+      gasEstimate: "5000",
+      gasUsd: "<$0.01",
+      action: "Solana Transaction",
+      description: "Solana transaction simulation not yet supported",
+      warnings: ["Solana simulation limited"],
+      details: {
+        from: session.solanaAddress || "unknown",
+        to: tx.to,
+        value: tx.value || "0",
+        valueUsd: "—",
+      },
+    };
+  }
+
+  const config = CHAIN_CONFIG[chain];
+  const warnings: string[] = [];
+
+  console.error(`[clara] Simulating transaction on ${chain}...`);
+
+  // Decode the transaction
+  const selector = tx.data?.slice(0, 10) || "0x";
+  const sigInfo = FUNCTION_SIGNATURES[selector];
+  const contractInfo = KNOWN_CONTRACTS[tx.to.toLowerCase()];
+
+  // Determine action and description
+  let action = "Contract Interaction";
+  let description = "Unknown contract call";
+
+  if (!tx.data || tx.data === "0x") {
+    action = "Native Transfer";
+    const valueEth = tx.value ? Number(BigInt(tx.value)) / 1e18 : 0;
+    description = `Send ${valueEth.toFixed(4)} ${chain === "polygon" ? "MATIC" : "ETH"}`;
+  } else if (sigInfo) {
+    action = sigInfo.name;
+    description = sigInfo.description;
+    if (sigInfo.risk) {
+      warnings.push(`⚠️ ${sigInfo.risk}`);
+    }
+  }
+
+  if (contractInfo) {
+    description += ` via ${contractInfo.name}`;
+  }
+
+  // Check for unlimited approval
+  if (selector === "0x095ea7b3" && tx.data && tx.data.length >= 74) {
+    const amountHex = "0x" + tx.data.slice(74);
+    try {
+      const amount = BigInt(amountHex);
+      const maxUint256 = BigInt("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+      if (amount === maxUint256) {
+        warnings.push("🚨 UNLIMITED APPROVAL - Contract can spend all your tokens");
+      } else if (amount > BigInt("1000000000000000000000000")) {
+        warnings.push("⚠️ Large approval amount");
+      }
+    } catch {
+      // Ignore parsing errors
+    }
+  }
+
+  // Check for high ETH value
+  const valueWei = tx.value ? BigInt(tx.value) : BigInt(0);
+  const valueEth = Number(valueWei) / 1e18;
+  if (valueEth > 1) {
+    warnings.push(`⚠️ Sending ${valueEth.toFixed(4)} ETH ($${(valueEth * 2500).toFixed(2)} approx)`);
+  }
+
+  // Simulate with eth_call
+  let success = true;
+  let error: string | undefined;
+
+  try {
+    const callResult = await fetch(config.rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "eth_call",
+        params: [
+          {
+            from: session.address,
+            to: tx.to,
+            value: tx.value ? `0x${BigInt(tx.value).toString(16)}` : "0x0",
+            data: tx.data || "0x",
+          },
+          "latest",
+        ],
+        id: 1,
+      }),
+    });
+
+    const result = (await callResult.json()) as { result?: string; error?: { message: string } };
+
+    if (result.error) {
+      success = false;
+      error = result.error.message;
+      if (error.includes("execution reverted")) {
+        warnings.push("🚨 Transaction would REVERT");
+      }
+    }
+  } catch (e) {
+    console.error("[clara] Simulation eth_call failed:", e);
+    warnings.push("⚠️ Could not simulate transaction");
+  }
+
+  // Estimate gas
+  const gasEstimate = await estimateGas(tx, chain);
+
+  // Get ETH price for value conversion
+  const prices = await fetchPrices();
+  const ethPrice = prices["ethereum"]?.usd || 2500;
+  const valueUsd = formatUsd(valueEth * ethPrice);
+
+  return {
+    success,
+    error,
+    gasEstimate: gasEstimate.gasLimit,
+    gasUsd: `~$${gasEstimate.estimatedCostUsd}`,
+    action,
+    description,
+    warnings,
+    details: {
+      from: session.address,
+      to: tx.to,
+      value: valueEth > 0 ? `${valueEth.toFixed(6)} ETH` : "0",
+      valueUsd: valueEth > 0 ? valueUsd : "—",
+      function: sigInfo?.name,
+      contract: contractInfo?.name,
+    },
+  };
+}
+
+// ============================================================================
+// Transaction History
+// ============================================================================
+
+/**
+ * Transaction history item
+ */
+export interface TransactionHistoryItem {
+  hash: string;
+  from: string;
+  to: string;
+  value: string;
+  valueEth: number;
+  timestamp: number;
+  date: string;
+  action: string;
+  status: "success" | "failed";
+  gasUsed: string;
+  gasPrice: string;
+  functionName?: string;
+  tokenSymbol?: string;
+  tokenAmount?: string;
+  isIncoming: boolean;
+  explorerUrl: string;
+}
+
+/**
+ * Transaction history response
+ */
+export interface TransactionHistory {
+  transactions: TransactionHistoryItem[];
+  address: string;
+  chain: SupportedChain;
+  hasMore: boolean;
+}
+
+/**
+ * Fetch transaction history from block explorer API
+ */
+export async function getTransactionHistory(
+  chain: SupportedChain,
+  options: {
+    limit?: number;
+    includeTokenTransfers?: boolean;
+  } = {}
+): Promise<TransactionHistory> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  const { limit = 10, includeTokenTransfers = true } = options;
+  const address = session.address.toLowerCase();
+
+  if (chain === "solana") {
+    // Solana history not yet supported
+    return {
+      transactions: [],
+      address: session.solanaAddress || address,
+      chain,
+      hasMore: false,
+    };
+  }
+
+  const explorer = EXPLORER_CONFIG[chain];
+  if (!explorer) {
+    throw new Error(`Explorer not configured for ${chain}`);
+  }
+
+  console.error(`[clara] Fetching transaction history for ${address} on ${chain}`);
+
+  const transactions: TransactionHistoryItem[] = [];
+
+  try {
+    // Fetch normal transactions
+    const txListUrl = `${explorer.apiUrl}?module=account&action=txlist&address=${address}&startblock=0&endblock=99999999&page=1&offset=${limit}&sort=desc`;
+
+    const txResponse = await fetch(txListUrl);
+    const txData = (await txResponse.json()) as {
+      status: string;
+      result: Array<{
+        hash: string;
+        from: string;
+        to: string;
+        value: string;
+        timeStamp: string;
+        isError: string;
+        gasUsed: string;
+        gasPrice: string;
+        functionName?: string;
+        input: string;
+      }>;
+    };
+
+    if (txData.status === "1" && Array.isArray(txData.result)) {
+      for (const tx of txData.result) {
+        const valueWei = BigInt(tx.value || "0");
+        const valueEth = Number(valueWei) / 1e18;
+        const isIncoming = tx.to.toLowerCase() === address;
+        const timestamp = parseInt(tx.timeStamp) * 1000;
+
+        // Decode action
+        let action = "Contract Call";
+        const selector = tx.input?.slice(0, 10) || "0x";
+
+        if (!tx.input || tx.input === "0x") {
+          action = isIncoming ? "Receive ETH" : "Send ETH";
+        } else if (FUNCTION_SIGNATURES[selector]) {
+          action = FUNCTION_SIGNATURES[selector].name;
+        } else if (tx.functionName) {
+          // Extract function name from "functionName(params)"
+          action = tx.functionName.split("(")[0];
+        }
+
+        transactions.push({
+          hash: tx.hash,
+          from: tx.from,
+          to: tx.to,
+          value: tx.value,
+          valueEth,
+          timestamp,
+          date: new Date(timestamp).toLocaleDateString("en-US", {
+            month: "short",
+            day: "numeric",
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+          action,
+          status: tx.isError === "0" ? "success" : "failed",
+          gasUsed: tx.gasUsed,
+          gasPrice: tx.gasPrice,
+          functionName: tx.functionName,
+          isIncoming,
+          explorerUrl: `${explorer.explorerUrl}/tx/${tx.hash}`,
+        });
+      }
+    }
+
+    // Fetch ERC-20 token transfers if requested
+    if (includeTokenTransfers) {
+      const tokenTxUrl = `${explorer.apiUrl}?module=account&action=tokentx&address=${address}&startblock=0&endblock=99999999&page=1&offset=${limit}&sort=desc`;
+
+      const tokenResponse = await fetch(tokenTxUrl);
+      const tokenData = (await tokenResponse.json()) as {
+        status: string;
+        result: Array<{
+          hash: string;
+          from: string;
+          to: string;
+          value: string;
+          timeStamp: string;
+          tokenSymbol: string;
+          tokenDecimal: string;
+          contractAddress: string;
+        }>;
+      };
+
+      if (tokenData.status === "1" && Array.isArray(tokenData.result)) {
+        for (const tx of tokenData.result) {
+          // Skip if we already have this tx from normal list
+          if (transactions.some((t) => t.hash === tx.hash)) continue;
+
+          const decimals = parseInt(tx.tokenDecimal) || 18;
+          const tokenAmount = Number(BigInt(tx.value)) / Math.pow(10, decimals);
+          const isIncoming = tx.to.toLowerCase() === address;
+          const timestamp = parseInt(tx.timeStamp) * 1000;
+
+          transactions.push({
+            hash: tx.hash,
+            from: tx.from,
+            to: tx.to,
+            value: tx.value,
+            valueEth: 0,
+            timestamp,
+            date: new Date(timestamp).toLocaleDateString("en-US", {
+              month: "short",
+              day: "numeric",
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+            action: isIncoming ? "Receive Token" : "Send Token",
+            status: "success",
+            gasUsed: "0",
+            gasPrice: "0",
+            tokenSymbol: tx.tokenSymbol,
+            tokenAmount: tokenAmount.toFixed(decimals > 6 ? 6 : decimals),
+            isIncoming,
+            explorerUrl: `${explorer.explorerUrl}/tx/${tx.hash}`,
+          });
+        }
+      }
+    }
+
+    // Sort by timestamp descending
+    transactions.sort((a, b) => b.timestamp - a.timestamp);
+
+    // Limit results
+    const limitedTxs = transactions.slice(0, limit);
+
+    return {
+      transactions: limitedTxs,
+      address,
+      chain,
+      hasMore: transactions.length > limit,
+    };
+  } catch (error) {
+    console.error(`[clara] Failed to fetch history:`, error);
+    return {
+      transactions: [],
+      address,
+      chain,
+      hasMore: false,
+    };
+  }
+}
+
+/**
+ * Format a transaction for display
+ */
+export function formatTransaction(tx: TransactionHistoryItem): string {
+  const icon = tx.status === "failed" ? "❌" : tx.isIncoming ? "📥" : "📤";
+  const amount = tx.tokenAmount
+    ? `${tx.tokenAmount} ${tx.tokenSymbol}`
+    : tx.valueEth > 0
+    ? `${tx.valueEth.toFixed(4)} ETH`
+    : "";
+
+  const counterparty = tx.isIncoming
+    ? `from ${tx.from.slice(0, 6)}...${tx.from.slice(-4)}`
+    : `to ${tx.to.slice(0, 6)}...${tx.to.slice(-4)}`;
+
+  return `${icon} ${tx.action}${amount ? ` (${amount})` : ""} ${counterparty} • ${tx.date}`;
+}
+
+// ============================================================================
+// Token Approval Management
+// ============================================================================
+
+/**
+ * Token approval information
+ */
+export interface TokenApproval {
+  tokenAddress: string;
+  tokenSymbol: string;
+  tokenDecimals: number;
+  spenderAddress: string;
+  spenderName?: string;
+  allowance: string;
+  allowanceRaw: string;
+  isUnlimited: boolean;
+  lastUpdated?: string;
+  txHash?: string;
+}
+
+/**
+ * Approval history response
+ */
+export interface ApprovalHistory {
+  approvals: TokenApproval[];
+  address: string;
+  chain: SupportedChain;
+}
+
+// Max uint256 value (unlimited approval)
+const MAX_UINT256 = BigInt("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+// Threshold to consider "unlimited" (99% of max uint256)
+const UNLIMITED_THRESHOLD = MAX_UINT256 * BigInt(99) / BigInt(100);
+
+/**
+ * Check current allowance for a specific token and spender
+ */
+export async function getAllowance(
+  tokenAddress: string,
+  spenderAddress: string,
+  chain: SupportedChain,
+  ownerAddress?: string
+): Promise<TokenApproval> {
+  if (chain === "solana") {
+    throw new Error("SPL tokens not yet supported");
+  }
+
+  const session = await getSession();
+  const owner = ownerAddress || session?.address;
+
+  if (!owner) {
+    throw new Error("No wallet address available");
+  }
+
+  const config = CHAIN_CONFIG[chain];
+
+  // Get token metadata
+  const metadata = await getTokenMetadata(tokenAddress, chain);
+
+  // Encode allowance(owner, spender) call
+  const paddedOwner = owner.slice(2).toLowerCase().padStart(64, "0");
+  const paddedSpender = spenderAddress.slice(2).toLowerCase().padStart(64, "0");
+  const calldata = ERC20_SELECTORS.allowance + paddedOwner + paddedSpender;
+
+  console.error(`[clara] Checking ${metadata.symbol} allowance for spender ${spenderAddress.slice(0, 8)}... on ${chain}`);
+
+  try {
+    const response = await fetch(config.rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "eth_call",
+        params: [{ to: tokenAddress, data: calldata }, "latest"],
+        id: 1,
+      }),
+    });
+
+    const data = (await response.json()) as { result?: string };
+    const allowanceRaw = data.result ? BigInt(data.result) : BigInt(0);
+    const isUnlimited = allowanceRaw >= UNLIMITED_THRESHOLD;
+
+    // Format allowance
+    let allowance: string;
+    if (isUnlimited) {
+      allowance = "Unlimited";
+    } else {
+      const allowanceNum = Number(allowanceRaw) / Math.pow(10, metadata.decimals);
+      allowance = allowanceNum.toFixed(metadata.decimals > 6 ? 6 : metadata.decimals);
+    }
+
+    // Look up known contract name
+    const spenderLower = spenderAddress.toLowerCase();
+    const knownContract = KNOWN_CONTRACTS[spenderLower];
+
+    return {
+      tokenAddress,
+      tokenSymbol: metadata.symbol,
+      tokenDecimals: metadata.decimals,
+      spenderAddress,
+      spenderName: knownContract?.name,
+      allowance,
+      allowanceRaw: allowanceRaw.toString(),
+      isUnlimited,
+    };
+  } catch (error) {
+    console.error(`[clara] Allowance check error:`, error);
+    return {
+      tokenAddress,
+      tokenSymbol: metadata.symbol,
+      tokenDecimals: metadata.decimals,
+      spenderAddress,
+      allowance: "0",
+      allowanceRaw: "0",
+      isUnlimited: false,
+    };
+  }
+}
+
+/**
+ * Get approval history from block explorer
+ * Fetches all Approval events for the user's address
+ */
+export async function getApprovalHistory(
+  chain: SupportedChain,
+  options: { limit?: number } = {}
+): Promise<ApprovalHistory> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  const { limit = 50 } = options;
+  const address = session.address.toLowerCase();
+
+  if (chain === "solana") {
+    return { approvals: [], address, chain };
+  }
+
+  const explorer = EXPLORER_CONFIG[chain];
+  if (!explorer) {
+    throw new Error(`Explorer not configured for ${chain}`);
+  }
+
+  console.error(`[clara] Fetching approval history for ${address} on ${chain}`);
+
+  try {
+    // Fetch ERC-20 approval events using tokentx endpoint
+    // We'll look for unique token+spender combinations
+    const tokenTxUrl = `${explorer.apiUrl}?module=account&action=tokentx&address=${address}&startblock=0&endblock=99999999&page=1&offset=${limit}&sort=desc`;
+
+    const response = await fetch(tokenTxUrl);
+    const data = (await response.json()) as {
+      status: string;
+      result: Array<{
+        hash: string;
+        from: string;
+        to: string;
+        contractAddress: string;
+        tokenSymbol: string;
+        tokenDecimal: string;
+        timeStamp: string;
+      }>;
+    };
+
+    // Track unique token+spender pairs we need to check
+    const spenderMap = new Map<string, Set<string>>();
+
+    if (data.status === "1" && Array.isArray(data.result)) {
+      for (const tx of data.result) {
+        // If we sent tokens, the recipient might be a contract that has approval
+        if (tx.from.toLowerCase() === address && tx.to.toLowerCase() !== address) {
+          const tokenAddr = tx.contractAddress.toLowerCase();
+          if (!spenderMap.has(tokenAddr)) {
+            spenderMap.set(tokenAddr, new Set());
+          }
+          spenderMap.get(tokenAddr)!.add(tx.to.toLowerCase());
+        }
+      }
+    }
+
+    // Also add common DeFi protocols to check for each token
+    const commonSpenders = [
+      "0x7a250d5630b4cf539739df2c5dacb4c659f2488d", // Uniswap V2 Router
+      "0xe592427a0aece92de3edee1f18e0157c05861564", // Uniswap V3 Router
+      "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45", // Universal Router
+      "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2", // Aave V3
+    ];
+
+    // Get all tokens user has interacted with
+    for (const [tokenAddr, spenders] of spenderMap.entries()) {
+      for (const commonSpender of commonSpenders) {
+        spenders.add(commonSpender);
+      }
+    }
+
+    // Check allowances for all token+spender pairs
+    const approvals: TokenApproval[] = [];
+
+    for (const [tokenAddr, spenders] of spenderMap.entries()) {
+      for (const spenderAddr of spenders) {
+        try {
+          const approval = await getAllowance(tokenAddr, spenderAddr, chain, address);
+          // Only include non-zero approvals
+          if (approval.allowanceRaw !== "0") {
+            approvals.push(approval);
+          }
+        } catch {
+          // Skip tokens that fail
+          continue;
+        }
+      }
+    }
+
+    // Sort by unlimited first, then by token symbol
+    approvals.sort((a, b) => {
+      if (a.isUnlimited && !b.isUnlimited) return -1;
+      if (!a.isUnlimited && b.isUnlimited) return 1;
+      return a.tokenSymbol.localeCompare(b.tokenSymbol);
+    });
+
+    return { approvals, address, chain };
+  } catch (error) {
+    console.error(`[clara] Failed to fetch approval history:`, error);
+    return { approvals: [], address, chain };
+  }
+}
+
+/**
+ * Encode ERC-20 approve calldata
+ * approve(address spender, uint256 amount)
+ * Use amount = "0" to revoke approval
+ */
+export function encodeApproveCalldata(spenderAddress: string, amount: string, decimals: number): string {
+  const paddedSpender = spenderAddress.slice(2).toLowerCase().padStart(64, "0");
+
+  let paddedAmount: string;
+  if (amount === "0") {
+    paddedAmount = "0".padStart(64, "0");
+  } else if (amount === "unlimited" || amount === "max") {
+    paddedAmount = MAX_UINT256.toString(16).padStart(64, "0");
+  } else {
+    const amountFloat = parseFloat(amount);
+    const amountRaw = BigInt(Math.floor(amountFloat * Math.pow(10, decimals)));
+    paddedAmount = amountRaw.toString(16).padStart(64, "0");
+  }
+
+  return ERC20_SELECTORS.approve + paddedSpender + paddedAmount;
+}
+
+/**
+ * Format an approval for display
+ */
+export function formatApproval(approval: TokenApproval): string {
+  const riskIcon = approval.isUnlimited ? "⚠️" : "✓";
+  const spenderDisplay = approval.spenderName
+    ? approval.spenderName
+    : `${approval.spenderAddress.slice(0, 6)}...${approval.spenderAddress.slice(-4)}`;
+
+  return `${riskIcon} ${approval.tokenSymbol} → ${spenderDisplay}: ${approval.allowance}`;
+}
+
+// ============================================================================
+// Token Swaps (via Li.Fi Aggregator)
+// ============================================================================
+
+// Li.Fi API - aggregates across multiple DEXs, no API key required
+const LIFI_API = "https://li.quest/v1";
+
+// Map our chain names to Li.Fi chain IDs
+const LIFI_CHAIN_IDS: Record<SupportedChain, number | null> = {
+  ethereum: 1,
+  base: 8453,
+  arbitrum: 42161,
+  optimism: 10,
+  polygon: 137,
+  solana: null, // Li.Fi doesn't support Solana swaps
+};
+
+// Native token address placeholder (used by Li.Fi for ETH/MATIC/etc)
+const NATIVE_TOKEN_ADDRESS = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+
+/**
+ * Swap quote from Li.Fi aggregator
+ */
+export interface SwapQuote {
+  id: string;
+  fromToken: {
+    address: string;
+    symbol: string;
+    decimals: number;
+    priceUsd: string;
+  };
+  toToken: {
+    address: string;
+    symbol: string;
+    decimals: number;
+    priceUsd: string;
+  };
+  fromAmount: string;
+  fromAmountUsd: string;
+  toAmount: string;
+  toAmountUsd: string;
+  toAmountMin: string;
+  exchangeRate: string;
+  priceImpact: string;
+  estimatedGas: string;
+  estimatedGasUsd: string;
+  approvalAddress?: string;
+  needsApproval: boolean;
+  currentAllowance?: string;
+  transactionRequest?: {
+    to: string;
+    data: string;
+    value: string;
+    gasLimit: string;
+  };
+  tool: string;
+  toolDetails?: string;
+}
+
+/**
+ * Get a swap quote from Li.Fi
+ * Finds the best route across multiple DEXs
+ */
+export async function getSwapQuote(
+  fromToken: string,
+  toToken: string,
+  amount: string,
+  chain: SupportedChain,
+  slippage: number = 0.5
+): Promise<SwapQuote> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  const chainId = LIFI_CHAIN_IDS[chain];
+  if (!chainId) {
+    throw new Error(`Swaps not supported on ${chain}`);
+  }
+
+  // Resolve token addresses
+  let fromAddress: string;
+  let toAddress: string;
+
+  // Handle native token (ETH, MATIC, etc.)
+  const nativeSymbols = ["ETH", "MATIC", "NATIVE"];
+
+  if (nativeSymbols.includes(fromToken.toUpperCase())) {
+    fromAddress = NATIVE_TOKEN_ADDRESS;
+  } else if (fromToken.startsWith("0x")) {
+    fromAddress = fromToken;
+  } else {
+    const resolved = resolveToken(fromToken, chain);
+    if (!resolved) {
+      throw new Error(`Unknown token: ${fromToken} on ${chain}`);
+    }
+    fromAddress = resolved.address;
+  }
+
+  if (nativeSymbols.includes(toToken.toUpperCase())) {
+    toAddress = NATIVE_TOKEN_ADDRESS;
+  } else if (toToken.startsWith("0x")) {
+    toAddress = toToken;
+  } else {
+    const resolved = resolveToken(toToken, chain);
+    if (!resolved) {
+      throw new Error(`Unknown token: ${toToken} on ${chain}`);
+    }
+    toAddress = resolved.address;
+  }
+
+  // Get token metadata for amount conversion
+  let fromDecimals = 18;
+  if (fromAddress !== NATIVE_TOKEN_ADDRESS) {
+    const metadata = await getTokenMetadata(fromAddress, chain);
+    fromDecimals = metadata.decimals;
+  }
+
+  // Convert amount to raw units (using precise BigInt parsing)
+  const amountRaw = parseAmountToBigInt(amount, fromDecimals);
+
+  console.error(`[clara] Getting swap quote: ${amount} ${fromToken} → ${toToken} on ${chain}`);
+
+  // Call Li.Fi quote endpoint
+  const params = new URLSearchParams({
+    fromChain: chainId.toString(),
+    toChain: chainId.toString(), // Same chain swap
+    fromToken: fromAddress,
+    toToken: toAddress,
+    fromAmount: amountRaw.toString(),
+    fromAddress: session.address,
+    slippage: (slippage / 100).toString(), // Convert percentage to decimal
+  });
+
+  try {
+    const response = await fetch(`${LIFI_API}/quote?${params}`);
+
+    if (!response.ok) {
+      const error = await response.text();
+      console.error(`[clara] Li.Fi API error: ${response.status} - ${error}`);
+      throw new Error(`Quote failed: ${response.status}`);
+    }
+
+    const data = await response.json() as {
+      id: string;
+      action: {
+        fromToken: { address: string; symbol: string; decimals: number; priceUSD: string };
+        toToken: { address: string; symbol: string; decimals: number; priceUSD: string };
+        fromAmount: string;
+        toAmount: string;
+        slippage: number;
+      };
+      estimate: {
+        toAmount: string;
+        toAmountMin: string;
+        fromAmountUSD: string;
+        toAmountUSD: string;
+        gasCosts: Array<{ amountUSD: string; estimate: string }>;
+        executionDuration: number;
+        approvalAddress?: string;
+      };
+      transactionRequest?: {
+        to: string;
+        data: string;
+        value: string;
+        gasLimit: string;
+      };
+      tool: string;
+      toolDetails?: { name: string };
+    };
+
+    // Calculate exchange rate
+    const fromAmountNum = parseFloat(amount);
+    const toAmountNum = Number(BigInt(data.estimate.toAmount)) / Math.pow(10, data.action.toToken.decimals);
+    const exchangeRate = (toAmountNum / fromAmountNum).toFixed(6);
+
+    // Calculate price impact (rough estimate from USD values)
+    const fromUsd = parseFloat(data.estimate.fromAmountUSD || "0");
+    const toUsd = parseFloat(data.estimate.toAmountUSD || "0");
+    const priceImpact = fromUsd > 0 ? (((fromUsd - toUsd) / fromUsd) * 100).toFixed(2) : "0";
+
+    // Check if approval is needed (for non-native tokens)
+    let needsApproval = false;
+    let currentAllowance: string | undefined;
+
+    if (fromAddress !== NATIVE_TOKEN_ADDRESS && data.estimate.approvalAddress) {
+      const approval = await getAllowance(fromAddress, data.estimate.approvalAddress, chain);
+      const requiredAmount = BigInt(data.action.fromAmount);
+      const currentAmount = BigInt(approval.allowanceRaw);
+      needsApproval = currentAmount < requiredAmount;
+      currentAllowance = approval.allowance;
+    }
+
+    // Sum up gas costs
+    const totalGasUsd = data.estimate.gasCosts.reduce((sum, g) => sum + parseFloat(g.amountUSD || "0"), 0);
+    const totalGasEstimate = data.estimate.gasCosts.reduce((sum, g) => sum + parseInt(g.estimate || "0"), 0);
+
+    return {
+      id: data.id,
+      fromToken: {
+        address: data.action.fromToken.address,
+        symbol: data.action.fromToken.symbol,
+        decimals: data.action.fromToken.decimals,
+        priceUsd: data.action.fromToken.priceUSD,
+      },
+      toToken: {
+        address: data.action.toToken.address,
+        symbol: data.action.toToken.symbol,
+        decimals: data.action.toToken.decimals,
+        priceUsd: data.action.toToken.priceUSD,
+      },
+      fromAmount: amount,
+      fromAmountUsd: data.estimate.fromAmountUSD || "0",
+      toAmount: toAmountNum.toFixed(data.action.toToken.decimals > 6 ? 6 : data.action.toToken.decimals),
+      toAmountUsd: data.estimate.toAmountUSD || "0",
+      toAmountMin: (Number(BigInt(data.estimate.toAmountMin)) / Math.pow(10, data.action.toToken.decimals)).toFixed(6),
+      exchangeRate,
+      priceImpact,
+      estimatedGas: totalGasEstimate.toString(),
+      estimatedGasUsd: totalGasUsd.toFixed(2),
+      approvalAddress: data.estimate.approvalAddress,
+      needsApproval,
+      currentAllowance,
+      transactionRequest: data.transactionRequest ? {
+        to: data.transactionRequest.to,
+        data: data.transactionRequest.data,
+        value: data.transactionRequest.value,
+        gasLimit: data.transactionRequest.gasLimit,
+      } : undefined,
+      tool: data.tool,
+      toolDetails: data.toolDetails?.name,
+    };
+  } catch (error) {
+    console.error(`[clara] Swap quote error:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Execute a swap using the quote's transaction request
+ */
+export async function executeSwap(
+  quote: SwapQuote,
+  chain: SupportedChain
+): Promise<{ txHash: string; status: string }> {
+  if (!quote.transactionRequest) {
+    throw new Error("Quote does not include transaction data. Get a fresh quote.");
+  }
+
+  if (quote.needsApproval) {
+    throw new Error(
+      `Approval needed first. Approve ${quote.fromToken.symbol} for spender ${quote.approvalAddress}`
+    );
+  }
+
+  console.error(`[clara] Executing swap: ${quote.fromAmount} ${quote.fromToken.symbol} → ${quote.toToken.symbol}`);
+
+  // Send the swap transaction
+  const result = await sendTransaction(
+    quote.transactionRequest.to,
+    "0", // Value is in the tx data
+    chain,
+    undefined,
+    quote.transactionRequest.data
+  );
+
+  return {
+    txHash: result.txHash,
+    status: "pending",
+  };
+}
+
+/**
+ * Get supported tokens for swapping on a chain
+ * Returns common tokens that Li.Fi supports
+ */
+export function getSwappableTokens(chain: SupportedChain): Array<{ symbol: string; address: string }> {
+  const tokens: Array<{ symbol: string; address: string }> = [];
+
+  // Add native token
+  const nativeSymbol = chain === "polygon" ? "MATIC" : "ETH";
+  tokens.push({ symbol: nativeSymbol, address: NATIVE_TOKEN_ADDRESS });
+
+  // Add popular tokens for this chain
+  for (const [symbol, chainData] of Object.entries(POPULAR_TOKENS)) {
+    const tokenInfo = chainData[chain];
+    if (tokenInfo) {
+      tokens.push({ symbol, address: tokenInfo.address });
+    }
+  }
+
+  return tokens;
+}
+
+// ============================================================================
+// Yield / Lending (DeFiLlama + Aave v3 Adapter)
+// ============================================================================
+
+// DeFiLlama Yields API (free, no API key)
+const DEFILLAMA_YIELDS_API = "https://yields.llama.fi";
+
+// Aave v3 Pool addresses per chain
+const AAVE_V3_POOLS: Record<string, { pool: string; poolDataProvider: string } | null> = {
+  ethereum: {
+    pool: "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2",
+    poolDataProvider: "0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3",
+  },
+  base: {
+    pool: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+    poolDataProvider: "0x2d8A3C5677189723C4cB8873CfC9C8976FDF38Ac",
+  },
+  arbitrum: {
+    pool: "0x794a61358D6845594F94dc1DB02A252b5b4814aD",
+    poolDataProvider: "0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654",
+  },
+  optimism: {
+    pool: "0x794a61358D6845594F94dc1DB02A252b5b4814aD",
+    poolDataProvider: "0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654",
+  },
+  polygon: {
+    pool: "0x794a61358D6845594F94dc1DB02A252b5b4814aD",
+    poolDataProvider: "0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654",
+  },
+};
+
+// Aave v3 function selectors
+const AAVE_SELECTORS = {
+  supply: "0x617ba037",      // supply(address,uint256,address,uint16)
+  withdraw: "0x69328dec",    // withdraw(address,uint256,address)
+};
+
+/**
+ * Yield opportunity from DeFiLlama
+ */
+export interface YieldOpportunity {
+  pool: string;           // DeFiLlama pool ID
+  chain: SupportedChain;
+  protocol: string;       // e.g., "aave-v3"
+  symbol: string;         // e.g., "USDC"
+  apy: number;            // Base APY (not including rewards)
+  apyReward: number | null;
+  apyTotal: number;       // Base + rewards
+  tvlUsd: number;
+  stablecoin: boolean;
+  underlyingTokens: string[];
+}
+
+/**
+ * Yield action plan (what we'll execute)
+ */
+export interface YieldPlan {
+  action: "deposit" | "withdraw";
+  protocol: string;
+  chain: SupportedChain;
+  asset: string;
+  assetAddress: string;
+  amount: string;
+  amountRaw: string;
+  apy: number;
+  tvlUsd: number;
+  poolContract: string;
+  transactionData: string;
+  needsApproval: boolean;
+  approvalAddress?: string;
+  estimatedGasUsd: string;
+}
+
+/**
+ * Fetch yield opportunities from DeFiLlama
+ * Filters for supported protocols and chains
+ */
+export async function getYieldOpportunities(
+  asset: string,
+  options: {
+    chains?: SupportedChain[];
+    minTvl?: number;
+    protocols?: string[];
+  } = {}
+): Promise<YieldOpportunity[]> {
+  const {
+    chains = ["base", "arbitrum"],
+    minTvl = 1_000_000, // $1M minimum TVL for safety
+    protocols = ["aave-v3", "compound-v3", "morpho-v1"], // Support major protocols
+  } = options;
+
+  console.error(`[clara] Fetching yields for ${asset} on ${chains.join(", ")}`);
+
+  try {
+    const response = await fetch(`${DEFILLAMA_YIELDS_API}/pools`);
+    if (!response.ok) {
+      throw new Error(`DeFiLlama API error: ${response.status}`);
+    }
+
+    const data = (await response.json()) as {
+      data: Array<{
+        pool: string;
+        chain: string;
+        project: string;
+        symbol: string;
+        tvlUsd: number;
+        apy: number;
+        apyBase: number | null;
+        apyReward: number | null;
+        stablecoin: boolean;
+        underlyingTokens: string[];
+      }>;
+    };
+
+    // Filter for matching opportunities
+    const assetUpper = asset.toUpperCase();
+    const opportunities: YieldOpportunity[] = [];
+
+    for (const pool of data.data) {
+      // Check chain
+      const chainLower = pool.chain.toLowerCase();
+      if (!chains.includes(chainLower as SupportedChain)) continue;
+
+      // Check protocol
+      if (!protocols.includes(pool.project)) continue;
+
+      // Check asset (symbol contains our asset)
+      if (!pool.symbol.toUpperCase().includes(assetUpper)) continue;
+
+      // Check TVL
+      if (pool.tvlUsd < minTvl) continue;
+
+      opportunities.push({
+        pool: pool.pool,
+        chain: chainLower as SupportedChain,
+        protocol: pool.project,
+        symbol: pool.symbol,
+        apy: pool.apyBase || 0,
+        apyReward: pool.apyReward,
+        apyTotal: pool.apy || 0,
+        tvlUsd: pool.tvlUsd,
+        stablecoin: pool.stablecoin,
+        underlyingTokens: pool.underlyingTokens || [],
+      });
+    }
+
+    // Sort by total APY descending
+    opportunities.sort((a, b) => b.apyTotal - a.apyTotal);
+
+    console.error(`[clara] Found ${opportunities.length} yield opportunities`);
+    return opportunities;
+  } catch (error) {
+    console.error(`[clara] Yield fetch error:`, error);
+    return [];
+  }
+}
+
+/**
+ * Get the best yield opportunity for an asset
+ */
+export async function getBestYield(
+  asset: string,
+  chains: SupportedChain[] = ["base", "arbitrum"]
+): Promise<YieldOpportunity | null> {
+  const opportunities = await getYieldOpportunities(asset, { chains });
+  return opportunities[0] || null;
+}
+
+/**
+ * Parse a decimal amount string to BigInt with the specified decimals.
+ * Handles arbitrary precision without floating-point errors.
+ *
+ * Examples:
+ *   parseAmountToBigInt("100", 6)      -> 100000000n (100 USDC)
+ *   parseAmountToBigInt("0.01", 6)     -> 10000n (0.01 USDC)
+ *   parseAmountToBigInt("1000000", 18) -> 1000000000000000000000000n (1M DAI, precise)
+ */
+export function parseAmountToBigInt(amount: string, decimals: number): bigint {
+  // Handle edge cases
+  if (!amount || amount === "0") return BigInt(0);
+
+  // Remove any whitespace and handle negative (shouldn't happen but be safe)
+  const cleanAmount = amount.trim();
+  if (cleanAmount.startsWith("-")) {
+    throw new Error("Negative amounts not supported");
+  }
+
+  // Split into whole and fractional parts
+  const parts = cleanAmount.split(".");
+  const wholePart = parts[0] || "0";
+  const fracPart = parts[1] || "";
+
+  // Validate: only digits allowed
+  if (!/^\d+$/.test(wholePart) || (fracPart && !/^\d+$/.test(fracPart))) {
+    throw new Error(`Invalid amount format: ${amount}`);
+  }
+
+  // Pad or truncate fractional part to match decimals
+  // If fracPart is longer than decimals, we truncate (floor behavior)
+  const paddedFrac = fracPart.padEnd(decimals, "0").slice(0, decimals);
+
+  // Combine: wholePart + paddedFrac gives us the raw amount
+  const rawString = wholePart + paddedFrac;
+
+  // Remove leading zeros (but keep at least one digit)
+  const trimmed = rawString.replace(/^0+/, "") || "0";
+
+  return BigInt(trimmed);
+}
+
+/**
+ * Encode Aave v3 supply transaction
+ * supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode)
+ */
+export function encodeAaveSupply(
+  assetAddress: string,
+  amount: string,
+  decimals: number,
+  onBehalfOf: string
+): string {
+  // Pad asset address (32 bytes)
+  const paddedAsset = assetAddress.slice(2).toLowerCase().padStart(64, "0");
+
+  // Pad amount (32 bytes) - using precise BigInt parsing
+  const amountRaw = parseAmountToBigInt(amount, decimals);
+  const paddedAmount = amountRaw.toString(16).padStart(64, "0");
+
+  // Pad onBehalfOf address (32 bytes)
+  const paddedOnBehalfOf = onBehalfOf.slice(2).toLowerCase().padStart(64, "0");
+
+  // Referral code = 0 (32 bytes)
+  const paddedReferral = "0".padStart(64, "0");
+
+  return AAVE_SELECTORS.supply + paddedAsset + paddedAmount + paddedOnBehalfOf + paddedReferral;
+}
+
+/**
+ * Encode Aave v3 withdraw transaction
+ * withdraw(address asset, uint256 amount, address to)
+ */
+export function encodeAaveWithdraw(
+  assetAddress: string,
+  amount: string,
+  decimals: number,
+  to: string
+): string {
+  const paddedAsset = assetAddress.slice(2).toLowerCase().padStart(64, "0");
+
+  // Use max uint256 for "withdraw all"
+  let paddedAmount: string;
+  if (amount === "max" || amount === "all") {
+    paddedAmount = MAX_UINT256.toString(16).padStart(64, "0");
+  } else {
+    // Use precise BigInt parsing
+    const amountRaw = parseAmountToBigInt(amount, decimals);
+    paddedAmount = amountRaw.toString(16).padStart(64, "0");
+  }
+
+  const paddedTo = to.slice(2).toLowerCase().padStart(64, "0");
+
+  return AAVE_SELECTORS.withdraw + paddedAsset + paddedAmount + paddedTo;
+}
+
+/**
+ * Create a yield deposit plan for the best available opportunity
+ */
+export async function createYieldPlan(
+  asset: string,
+  amount: string,
+  preferredChains: SupportedChain[] = ["base", "arbitrum"]
+): Promise<YieldPlan | null> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  // Find best yield opportunity (now checks both Aave and Compound)
+  const best = await getBestYield(asset, preferredChains);
+  if (!best) {
+    return null;
+  }
+
+  // Get the protocol adapter
+  const adapter = getProtocolAdapter(best.protocol);
+  if (!adapter) {
+    console.error(`[clara] Unsupported protocol: ${best.protocol}`);
+    return null;
+  }
+
+  // Verify chain is supported by this adapter
+  if (!adapter.supportedChains.includes(best.chain)) {
+    console.error(`[clara] ${adapter.displayName} not available on ${best.chain}`);
+    return null;
+  }
+
+  // Get pool address from adapter
+  const poolAddress = adapter.getPoolAddress(best.chain);
+  if (!poolAddress) {
+    console.error(`[clara] ${adapter.displayName} pool not configured for ${best.chain}`);
+    return null;
+  }
+
+  // Get asset address on this chain
+  const tokenInfo = resolveToken(asset, best.chain);
+  if (!tokenInfo) {
+    console.error(`[clara] Token ${asset} not found on ${best.chain}`);
+    return null;
+  }
+
+  // Check if approval is needed
+  const approval = await getAllowance(tokenInfo.address, poolAddress, best.chain);
+  const amountRaw = parseAmountToBigInt(amount, tokenInfo.decimals);
+  const needsApproval = BigInt(approval.allowanceRaw) < amountRaw;
+
+  // Encode the supply transaction using the adapter
+  const encoded = adapter.encodeSupply({
+    assetAddress: tokenInfo.address,
+    amount,
+    decimals: tokenInfo.decimals,
+    onBehalfOf: session.address,
+    chain: best.chain,
+  });
+
+  return {
+    action: "deposit",
+    protocol: adapter.displayName,
+    chain: best.chain,
+    asset: tokenInfo.symbol,
+    assetAddress: tokenInfo.address,
+    amount,
+    amountRaw: encoded.amountRaw,
+    apy: best.apyTotal,
+    tvlUsd: best.tvlUsd,
+    poolContract: encoded.to,
+    transactionData: encoded.data,
+    needsApproval,
+    approvalAddress: needsApproval ? encoded.to : undefined,
+    estimatedGasUsd: "0.50", // Rough estimate
+  };
+}
+
+/**
+ * Execute a yield deposit
+ * Records the transaction for earnings tracking
+ */
+export async function executeYieldDeposit(
+  plan: YieldPlan
+): Promise<{ txHash: string; status: string }> {
+  if (plan.needsApproval) {
+    throw new Error("Approval needed first");
+  }
+
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  console.error(`[clara] Executing yield deposit: ${plan.amount} ${plan.asset} → ${plan.protocol} on ${plan.chain}`);
+
+  const result = await sendTransaction(
+    plan.poolContract,
+    "0", // No ETH value for ERC-20 supply
+    plan.chain,
+    undefined,
+    plan.transactionData
+  );
+
+  // Record transaction for earnings tracking
+  try {
+    await recordYieldTransaction(session.address, {
+      action: "deposit",
+      protocol: plan.protocol.toLowerCase().replace(/\s+/g, "-"), // "Aave v3" -> "aave-v3"
+      chain: plan.chain,
+      asset: plan.asset,
+      amount: plan.amount,
+      amountRaw: plan.amountRaw,
+      txHash: result.txHash,
+    });
+    console.error(`[clara] Recorded deposit transaction for earnings tracking`);
+  } catch (error) {
+    console.error(`[clara] Failed to record deposit transaction:`, error);
+    // Don't fail the deposit if recording fails
+  }
+
+  return {
+    txHash: result.txHash,
+    status: "pending",
+  };
+}
+
+/**
+ * User's position in a yield protocol
+ */
+export interface YieldPosition {
+  protocol: string;
+  chain: SupportedChain;
+  asset: string;
+  assetAddress: string;
+  aTokenAddress: string;
+  deposited: string;
+  depositedRaw: string;
+  currentApy: number;
+  valueUsd: string;
+}
+
+// Aave v3 aToken addresses (receipt tokens for deposits)
+const AAVE_ATOKENS: Record<string, Record<string, string>> = {
+  base: {
+    USDC: "0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB",
+    USDbC: "0x0a1d576f3eFeF75b330424287a95A366e8281D54",
+    DAI: "0x0000000000000000000000000000000000000000", // Not available on Base
+    WETH: "0xD4a0e0b9149BCee3C920d2E00b5dE09138fd8bb7",
+  },
+  arbitrum: {
+    USDC: "0x724dc807b04555b71ed48a6896b6F41593b8C637",
+    "USDC.e": "0x625E7708f30cA75bfd92586e17077590C60eb4cD",
+    USDT: "0x6ab707Aca953eDAeFBc4fD23bA73294241490620",
+    DAI: "0x82E64f49Ed5EC1bC6e43DAD4FC8Af9bb3A2312EE",
+    WETH: "0xe50fA9b3c56FfB159cB0FCA61F5c9D750e8128c8",
+  },
+};
+
+/**
+ * Get user's yield positions across chains and protocols
+ * Now supports Aave V3 and Compound V3 via adapter pattern
+ * Includes USD valuation via price oracle
+ */
+export async function getYieldPositions(
+  chains: SupportedChain[] = ["base", "arbitrum"],
+  protocols: string[] = ["aave-v3", "compound-v3"]
+): Promise<YieldPosition[]> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  const positions: YieldPosition[] = [];
+
+  // Collect all positions with balances (without prices yet)
+  const positionsWithoutPrice: Array<{
+    protocol: string;
+    protocolId: string;
+    chain: SupportedChain;
+    symbol: string;
+    receiptTokenAddress: string;
+    balance: string;
+    balanceRaw: string;
+    underlying: { address: string } | null;
+    currentApy: number;
+  }> = [];
+
+  // Check each protocol
+  for (const protocolId of protocols) {
+    const adapter = getProtocolAdapter(protocolId);
+    if (!adapter) continue;
+
+    // Check each chain for this protocol
+    for (const chain of chains) {
+      if (!adapter.supportedChains.includes(chain)) continue;
+
+      // Get assets to check for this protocol/chain
+      // For Aave, check aTokens; for Compound, check Comet balances
+      const assetsToCheck = getAssetsForProtocol(protocolId, chain);
+
+      for (const symbol of assetsToCheck) {
+        const receiptToken = adapter.getReceiptToken(symbol, chain);
+        if (!receiptToken || receiptToken === "0x0000000000000000000000000000000000000000") {
+          continue;
+        }
+
+        try {
+          const balance = await getTokenBalance(receiptToken, chain, session.address);
+          const balanceNum = parseFloat(balance.balance);
+
+          if (balanceNum > 0.0001) { // Only show positions above dust
+            const underlying = resolveToken(symbol, chain);
+            const yields = await getYieldOpportunities(symbol, {
+              chains: [chain],
+              protocols: [protocolId],
+            });
+            const currentApy = yields[0]?.apyTotal || 0;
+
+            positionsWithoutPrice.push({
+              protocol: adapter.displayName,
+              protocolId,
+              chain,
+              symbol,
+              receiptTokenAddress: receiptToken,
+              balance: balance.balance,
+              balanceRaw: balance.balanceRaw,
+              underlying,
+              currentApy,
+            });
+          }
+        } catch (error) {
+          console.error(`[clara] Error checking ${symbol} in ${adapter.displayName} on ${chain}:`, error);
+          continue;
+        }
+      }
+    }
+  }
+
+  // Batch fetch prices for all position symbols
+  const symbols = [...new Set(positionsWithoutPrice.map(p => p.symbol))];
+  const prices = await getTokenPricesUsd(symbols);
+
+  // Build final positions with USD values
+  for (const pos of positionsWithoutPrice) {
+    const price = prices[pos.symbol];
+    const balanceNum = parseFloat(pos.balance);
+    const valueUsd = price !== undefined
+      ? (balanceNum * price).toFixed(2)
+      : "—";
+
+    positions.push({
+      protocol: pos.protocol,
+      chain: pos.chain,
+      asset: pos.symbol,
+      assetAddress: pos.underlying?.address || "",
+      aTokenAddress: pos.receiptTokenAddress, // Keep field name for compatibility
+      deposited: pos.balance,
+      depositedRaw: pos.balanceRaw,
+      currentApy: pos.currentApy,
+      valueUsd,
+    });
+  }
+
+  return positions;
+}
+
+/**
+ * Get the list of assets to check for a protocol on a chain
+ * This is needed because each protocol supports different assets
+ */
+function getAssetsForProtocol(protocolId: string, chain: SupportedChain): string[] {
+  // Common stablecoins and assets across protocols
+  const commonAssets = ["USDC", "USDT", "DAI", "WETH"];
+
+  // Protocol-specific additions
+  if (protocolId === "aave-v3") {
+    if (chain === "base") return ["USDC", "USDbC", "WETH"];
+    if (chain === "arbitrum") return ["USDC", "USDC.e", "USDT", "DAI", "WETH"];
+    return commonAssets;
+  }
+
+  if (protocolId === "compound-v3") {
+    // Compound V3 has specific Comet markets
+    if (chain === "base") return ["USDC", "USDbC", "WETH"];
+    if (chain === "arbitrum") return ["USDC", "USDC.e", "WETH"];
+    if (chain === "ethereum") return ["USDC", "WETH"];
+    if (chain === "polygon") return ["USDC"];
+    if (chain === "optimism") return ["USDC", "WETH"];
+    return ["USDC"];
+  }
+
+  return commonAssets;
+}
+
+/**
+ * Create a withdrawal plan for yield positions
+ * Now supports multiple protocols via adapter pattern
+ */
+export async function createWithdrawPlan(
+  asset: string,
+  amount: string, // "all" or specific amount
+  chain: SupportedChain,
+  protocol: string = "aave-v3" // Default to Aave for backwards compatibility
+): Promise<YieldPlan | null> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  // Get the protocol adapter
+  const adapter = getProtocolAdapter(protocol);
+  if (!adapter) {
+    console.error(`[clara] Unsupported protocol: ${protocol}`);
+    return null;
+  }
+
+  // Verify chain support
+  if (!adapter.supportedChains.includes(chain)) {
+    console.error(`[clara] ${adapter.displayName} not available on ${chain}`);
+    return null;
+  }
+
+  // Get pool address
+  const poolAddress = adapter.getPoolAddress(chain);
+  if (!poolAddress) {
+    console.error(`[clara] ${adapter.displayName} not configured for ${chain}`);
+    return null;
+  }
+
+  // Get token info
+  const tokenInfo = resolveToken(asset, chain);
+  if (!tokenInfo) {
+    console.error(`[clara] Token ${asset} not found on ${chain}`);
+    return null;
+  }
+
+  // Get receipt token address (aToken for Aave, Comet for Compound)
+  const receiptTokenAddress = adapter.getReceiptToken(tokenInfo.symbol, chain);
+  if (!receiptTokenAddress || receiptTokenAddress === "0x0000000000000000000000000000000000000000") {
+    console.error(`[clara] No receipt token for ${asset} on ${chain} in ${adapter.displayName}`);
+    return null;
+  }
+
+  // Check deposited balance
+  const receiptBalance = await getTokenBalance(receiptTokenAddress, chain, session.address);
+  const depositedNum = parseFloat(receiptBalance.balance);
+
+  if (depositedNum < 0.0001) {
+    console.error(`[clara] No ${asset} deposited in ${adapter.displayName} on ${chain}`);
+    return null;
+  }
+
+  // Determine withdrawal amount
+  const isWithdrawAll = amount === "all" || amount === "max";
+  const withdrawAmount = isWithdrawAll ? receiptBalance.balance : amount;
+  const withdrawNum = parseFloat(withdrawAmount);
+
+  if (withdrawNum > depositedNum) {
+    console.error(`[clara] Cannot withdraw ${withdrawAmount}, only ${receiptBalance.balance} deposited`);
+    return null;
+  }
+
+  // Get current APY for display
+  const yields = await getYieldOpportunities(asset, { chains: [chain], protocols: [protocol] });
+  const currentApy = yields[0]?.apyTotal || 0;
+  const tvlUsd = yields[0]?.tvlUsd || 0;
+
+  // Encode withdraw transaction using adapter
+  const encoded = adapter.encodeWithdraw({
+    assetAddress: tokenInfo.address,
+    amount: isWithdrawAll ? "max" : withdrawAmount,
+    decimals: tokenInfo.decimals,
+    to: session.address,
+    chain,
+  });
+
+  return {
+    action: "withdraw",
+    protocol: adapter.displayName,
+    chain,
+    asset: tokenInfo.symbol,
+    assetAddress: tokenInfo.address,
+    amount: withdrawAmount,
+    amountRaw: encoded.amountRaw,
+    apy: currentApy,
+    tvlUsd,
+    poolContract: encoded.to,
+    transactionData: encoded.data,
+    needsApproval: false, // No approval needed for withdraws
+    estimatedGasUsd: "0.30",
+  };
+}
+
+/**
+ * Execute a yield withdrawal
+ * Records the transaction for earnings tracking
+ */
+export async function executeYieldWithdraw(
+  plan: YieldPlan
+): Promise<{ txHash: string; status: string }> {
+  if (plan.action !== "withdraw") {
+    throw new Error("Invalid plan - not a withdraw action");
+  }
+
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  console.error(`[clara] Executing yield withdraw: ${plan.amount} ${plan.asset} from ${plan.protocol} on ${plan.chain}`);
+
+  const result = await sendTransaction(
+    plan.poolContract,
+    "0",
+    plan.chain,
+    undefined,
+    plan.transactionData
+  );
+
+  // Record transaction for earnings tracking
+  try {
+    await recordYieldTransaction(session.address, {
+      action: "withdraw",
+      protocol: plan.protocol.toLowerCase().replace(/\s+/g, "-"),
+      chain: plan.chain,
+      asset: plan.asset,
+      amount: plan.amount,
+      amountRaw: plan.amountRaw,
+      txHash: result.txHash,
+    });
+    console.error(`[clara] Recorded withdrawal transaction for earnings tracking`);
+  } catch (error) {
+    console.error(`[clara] Failed to record withdrawal transaction:`, error);
+  }
+
+  return {
+    txHash: result.txHash,
+    status: "pending",
+  };
+}
+
+/**
+ * Format a yield opportunity for display
+ */
+export function formatYieldOpportunity(opp: YieldOpportunity): string {
+  const apyStr = opp.apyTotal.toFixed(2);
+  const tvlStr = (opp.tvlUsd / 1_000_000).toFixed(1);
+  return `${opp.protocol} on ${opp.chain}: ${apyStr}% APY ($${tvlStr}M TVL)`;
+}
+
+/**
+ * Yield earnings for a single position
+ */
+export interface YieldEarnings {
+  asset: string;
+  chain: SupportedChain;
+  protocol: string;
+  totalDeposited: string;      // Sum of all deposits
+  totalWithdrawn: string;      // Sum of all withdrawals
+  netDeposited: string;        // deposited - withdrawn
+  currentBalance: string;      // Current aToken balance
+  earnedYield: string;         // currentBalance - netDeposited
+  earnedYieldUsd: string;      // USD value of earnings
+  earnedYieldPercent: string;  // Percentage gain
+  periodDays: number;          // Days since first deposit
+  effectiveApy: string | null; // Realized APY
+}
+
+/**
+ * Get earnings for a specific yield position
+ */
+export async function getYieldEarnings(
+  asset: string,
+  chain: SupportedChain,
+  protocol: string = "aave-v3"
+): Promise<YieldEarnings | null> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  // Get current position
+  const positions = await getYieldPositions([chain]);
+  const position = positions.find(
+    (p) =>
+      p.asset.toUpperCase() === asset.toUpperCase() &&
+      p.chain === chain &&
+      p.protocol.toLowerCase().replace(/\s+/g, "-") === protocol.toLowerCase()
+  );
+
+  if (!position) {
+    return null;
+  }
+
+  // Get transaction history
+  const transactions = await getTransactionsForPosition(
+    session.address,
+    asset,
+    chain,
+    protocol
+  );
+
+  const currentBalance = parseFloat(position.deposited);
+  const earnings = calculateEarnings(transactions, currentBalance);
+
+  // Get USD price for earnings
+  const price = await getTokenPriceUsd(asset);
+  const earnedYieldUsd = price !== null
+    ? (earnings.earnedYield * price).toFixed(2)
+    : "—";
+
+  return {
+    asset: position.asset,
+    chain: position.chain,
+    protocol: position.protocol,
+    totalDeposited: earnings.netDeposited >= 0
+      ? (earnings.netDeposited + Math.max(0, -earnings.earnedYield)).toFixed(6)
+      : "0",
+    totalWithdrawn: "0", // Simplified for now
+    netDeposited: earnings.netDeposited.toFixed(6),
+    currentBalance: position.deposited,
+    earnedYield: earnings.earnedYield.toFixed(6),
+    earnedYieldUsd,
+    earnedYieldPercent: earnings.earnedYieldPercent.toFixed(2),
+    periodDays: Math.floor(earnings.periodDays),
+    effectiveApy: earnings.effectiveApy !== null
+      ? earnings.effectiveApy.toFixed(2)
+      : null,
+  };
+}
+
+/**
+ * Get earnings summary for all positions
+ */
+export async function getAllYieldEarnings(): Promise<{
+  positions: YieldEarnings[];
+  totalEarnedUsd: string;
+}> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  // Get all current positions
+  const positions = await getYieldPositions();
+
+  const earningsPromises = positions.map((pos) =>
+    getYieldEarnings(pos.asset, pos.chain, pos.protocol)
+  );
+
+  const allEarnings = await Promise.all(earningsPromises);
+  const validEarnings = allEarnings.filter((e): e is YieldEarnings => e !== null);
+
+  // Calculate total earned USD
+  let totalEarned = 0;
+  for (const e of validEarnings) {
+    const usd = parseFloat(e.earnedYieldUsd);
+    if (!isNaN(usd)) {
+      totalEarned += usd;
+    }
+  }
+
+  return {
+    positions: validEarnings,
+    totalEarnedUsd: totalEarned.toFixed(2),
+  };
+}
+
+// Re-export history types and functions for external use
+export type { YieldTransaction };
+export {
+  recordYieldTransaction,
+  getTransactionsForPosition,
+  calculateEarnings,
+  getYieldEarningsSummary,
+};
+
+export { CHAIN_CONFIG, EXPLORER_CONFIG, NATIVE_TOKEN_ADDRESS, AAVE_V3_POOLS };
+
+// Re-export protocol adapter utilities
+export { getProtocolAdapter, getSupportedProtocols };
+
+// ============================================================================
+// Dashboard / Onboarding
+// ============================================================================
+
+/**
+ * Dashboard data for the /clara command
+ */
+export interface ClaraDashboard {
+  authenticated: boolean;
+  wallet?: {
+    address: string;
+    shortAddress: string;
+  };
+  portfolio?: {
+    totalValueUsd: string;
+    chains: Array<{
+      chain: SupportedChain;
+      nativeBalance: string;
+      nativeValueUsd: string;
+      tokens: Array<{
+        symbol: string;
+        balance: string;
+        valueUsd: string;
+      }>;
+    }>;
+  };
+  yieldPositions?: {
+    positions: Array<{
+      protocol: string;
+      chain: SupportedChain;
+      asset: string;
+      deposited: string;
+      valueUsd: string;
+      apy: number;
+    }>;
+    totalValueUsd: string;
+    weightedApy: number;
+    lifetimeEarnings: string;
+  };
+  pendingApprovals?: Array<{
+    chain: SupportedChain;
+    token: string;
+    spender: string;
+    spenderName: string | null;
+    allowance: string;
+    isUnlimited: boolean;
+    isRisky: boolean;
+  }>;
+  recentActivity?: Array<{
+    type: string;
+    description: string;
+    timestamp: string;
+    chain: SupportedChain;
+  }>;
+}
+
+/**
+ * Get complete dashboard data for the /clara command
+ * Gathers portfolio, yield positions, approvals, and activity in parallel
+ */
+export async function getClaraDashboard(): Promise<ClaraDashboard> {
+  const session = await getSession();
+
+  if (!session?.authenticated || !session.address) {
+    return { authenticated: false };
+  }
+
+  const address = session.address;
+  const shortAddress = `${address.slice(0, 6)}...${address.slice(-4)}`;
+
+  // Gather data in parallel for speed
+  const [portfolioData, yieldData, earningsData] = await Promise.all([
+    getPortfolioData(address),
+    getYieldPositions(["base", "arbitrum"]).catch(() => []),
+    getAllYieldEarnings().catch(() => ({ positions: [], totalEarnedUsd: "0" })),
+  ]);
+
+  // Build portfolio section
+  const portfolio = portfolioData ? {
+    totalValueUsd: portfolioData.totalValueUsd,
+    chains: portfolioData.chains,
+  } : undefined;
+
+  // Build yield positions section
+  let yieldPositions: ClaraDashboard["yieldPositions"] = undefined;
+  if (yieldData && yieldData.length > 0) {
+    const positions = yieldData.map(p => ({
+      protocol: p.protocol,
+      chain: p.chain,
+      asset: p.asset,
+      deposited: p.deposited,
+      valueUsd: p.valueUsd,
+      apy: p.currentApy,
+    }));
+
+    // Calculate weighted APY
+    let totalValue = 0;
+    let weightedApySum = 0;
+    for (const p of positions) {
+      const value = parseFloat(p.valueUsd) || 0;
+      totalValue += value;
+      weightedApySum += value * p.apy;
+    }
+    const weightedApy = totalValue > 0 ? weightedApySum / totalValue : 0;
+
+    yieldPositions = {
+      positions,
+      totalValueUsd: totalValue.toFixed(2),
+      weightedApy: Math.round(weightedApy * 100) / 100,
+      lifetimeEarnings: earningsData.totalEarnedUsd,
+    };
+  }
+
+  return {
+    authenticated: true,
+    wallet: { address, shortAddress },
+    portfolio,
+    yieldPositions,
+    pendingApprovals: [], // Would need to implement approval scanning
+    recentActivity: [], // Would need to implement activity fetching
+  };
+}
+
+/**
+ * Helper to get portfolio data across chains
+ */
+async function getPortfolioData(address: string): Promise<{
+  totalValueUsd: string;
+  chains: Array<{
+    chain: SupportedChain;
+    nativeBalance: string;
+    nativeValueUsd: string;
+    tokens: Array<{ symbol: string; balance: string; valueUsd: string }>;
+  }>;
+} | null> {
+  const chains: SupportedChain[] = ["base", "arbitrum", "ethereum"];
+  const chainData: Array<{
+    chain: SupportedChain;
+    nativeBalance: string;
+    nativeValueUsd: string;
+    tokens: Array<{ symbol: string; balance: string; valueUsd: string }>;
+  }> = [];
+
+  let totalValue = 0;
+
+  for (const chain of chains) {
+    try {
+      // Get native balance
+      const nativeBalance = await getNativeBalance(chain, address);
+      const nativeNum = parseFloat(nativeBalance.balance);
+
+      // Get ETH price
+      const ethPrice = await getTokenPriceUsd("ETH");
+      const nativeValueUsd = ethPrice ? (nativeNum * ethPrice).toFixed(2) : "0";
+      totalValue += parseFloat(nativeValueUsd);
+
+      // Get major token balances
+      const tokens: Array<{ symbol: string; balance: string; valueUsd: string }> = [];
+      const tokensToCheck = ["USDC", "USDT", "DAI"];
+
+      for (const symbol of tokensToCheck) {
+        const tokenInfo = resolveToken(symbol, chain);
+        if (tokenInfo) {
+          try {
+            const balance = await getTokenBalance(tokenInfo.address, chain, address);
+            const balanceNum = parseFloat(balance.balance);
+            if (balanceNum > 0.01) {
+              const price = await getTokenPriceUsd(symbol);
+              const valueUsd = price ? (balanceNum * price).toFixed(2) : "0";
+              totalValue += parseFloat(valueUsd);
+              tokens.push({ symbol, balance: balance.balance, valueUsd });
+            }
+          } catch {
+            // Token not found or error, skip
+          }
+        }
+      }
+
+      if (nativeNum > 0.0001 || tokens.length > 0) {
+        chainData.push({
+          chain,
+          nativeBalance: nativeBalance.balance,
+          nativeValueUsd,
+          tokens,
+        });
+      }
+    } catch (error) {
+      console.error(`[clara] Error fetching portfolio for ${chain}:`, error);
+    }
+  }
+
+  if (chainData.length === 0) {
+    return null;
+  }
+
+  return {
+    totalValueUsd: totalValue.toFixed(2),
+    chains: chainData,
+  };
+}
+
+/**
+ * Format the dashboard as ASCII art
+ */
+export function formatClaraDashboard(dashboard: ClaraDashboard): string {
+  if (!dashboard.authenticated) {
+    return `
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│      ██████╗██╗      █████╗ ██████╗  █████╗                     │
+│     ██╔════╝██║     ██╔══██╗██╔══██╗██╔══██╗                    │
+│     ██║     ██║     ███████║██████╔╝███████║                    │
+│     ██║     ██║     ██╔══██║██╔══██╗██╔══██║                    │
+│     ╚██████╗███████╗██║  ██║██║  ██║██║  ██║                    │
+│      ╚═════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝                    │
+│                                                                 │
+│              Your AI-powered DeFi companion                     │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ⚠️  Wallet not connected                                       │
+│                                                                 │
+│   Get started by saying:                                        │
+│   → "Set up my wallet"                                          │
+│   → "Create a wallet with my email"                             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘`;
+  }
+
+  const lines: string[] = [];
+
+  // Header
+  lines.push(`┌─────────────────────────────────────────────────────────────────┐`);
+  lines.push(`│                                                                 │`);
+  lines.push(`│      ██████╗██╗      █████╗ ██████╗  █████╗                     │`);
+  lines.push(`│     ██╔════╝██║     ██╔══██╗██╔══██╗██╔══██╗                    │`);
+  lines.push(`│     ██║     ██║     ███████║██████╔╝███████║                    │`);
+  lines.push(`│     ██║     ██║     ██╔══██║██╔══██╗██╔══██║                    │`);
+  lines.push(`│     ╚██████╗███████╗██║  ██║██║  ██║██║  ██║                    │`);
+  lines.push(`│      ╚═════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝                    │`);
+  lines.push(`│                                                                 │`);
+  lines.push(`│              Your AI-powered DeFi companion                     │`);
+  lines.push(`│                                                                 │`);
+  lines.push(`├─────────────────────────────────────────────────────────────────┤`);
+
+  // Wallet address
+  if (dashboard.wallet) {
+    lines.push(`│  WALLET                                                         │`);
+    lines.push(`│  ${dashboard.wallet.shortAddress.padEnd(61)}│`);
+    lines.push(`├─────────────────────────────────────────────────────────────────┤`);
+  }
+
+  // Total balance
+  if (dashboard.portfolio) {
+    lines.push(`│                                                                 │`);
+    lines.push(`│  💰 TOTAL BALANCE                                               │`);
+    const balanceStr = `$${dashboard.portfolio.totalValueUsd}`;
+    const padding = Math.floor((55 - balanceStr.length) / 2);
+    lines.push(`│  ┌───────────────────────────────────────────────────────────┐  │`);
+    lines.push(`│  │${' '.repeat(padding)}${balanceStr}${' '.repeat(55 - padding - balanceStr.length)}│  │`);
+    lines.push(`│  └───────────────────────────────────────────────────────────┘  │`);
+    lines.push(`│                                                                 │`);
+  }
+
+  // Yield positions
+  if (dashboard.yieldPositions && dashboard.yieldPositions.positions.length > 0) {
+    lines.push(`├─────────────────────────────────────────────────────────────────┤`);
+    lines.push(`│                                                                 │`);
+    lines.push(`│  🌾 YIELD POSITIONS                                             │`);
+    lines.push(`│  ┌─────────────┬──────────────┬─────────────┬────────────────┐  │`);
+    lines.push(`│  │ Protocol    │ Asset        │ Deposited   │ APY            │  │`);
+    lines.push(`│  ├─────────────┼──────────────┼─────────────┼────────────────┤  │`);
+
+    for (const pos of dashboard.yieldPositions.positions.slice(0, 5)) {
+      const protocol = pos.protocol.slice(0, 11).padEnd(11);
+      const asset = `${pos.asset} (${pos.chain.slice(0, 4)})`.slice(0, 12).padEnd(12);
+      const deposited = `$${pos.valueUsd}`.slice(0, 11).padEnd(11);
+      const apy = `${pos.apy.toFixed(2)}%`.padEnd(14);
+      lines.push(`│  │ ${protocol} │ ${asset} │ ${deposited} │ ${apy} │  │`);
+    }
+
+    lines.push(`│  └─────────────┴──────────────┴─────────────┴────────────────┘  │`);
+    lines.push(`│  Total: $${dashboard.yieldPositions.totalValueUsd} @ ${dashboard.yieldPositions.weightedApy.toFixed(2)}% APY | Earned: +$${dashboard.yieldPositions.lifetimeEarnings}`.slice(0, 63).padEnd(63) + `│`);
+    lines.push(`│                                                                 │`);
+  }
+
+  lines.push(`└─────────────────────────────────────────────────────────────────┘`);
+
+  return lines.join('\n');
+}
+
+// ============================================================================
+// Gas Management - Auto-swap for Gas
+// ============================================================================
+
+/**
+ * Gas check result
+ * Returns whether the user has enough gas and what steps are needed
+ */
+export interface GasCheckResult {
+  /** Does user have enough native token for gas? */
+  hasEnoughGas: boolean;
+  /** Native token balance in human units (e.g., "0.01") */
+  nativeBalance: string;
+  /** Native token symbol (ETH, MATIC) */
+  nativeSymbol: string;
+  /** Estimated gas cost in native units */
+  estimatedGasCost: string;
+  /** Estimated gas cost in USD */
+  estimatedGasUsd: string;
+  /** If gas insufficient, suggested swap details */
+  suggestedSwap?: {
+    fromToken: string;
+    fromAmount: string;
+    fromAmountUsd: string;
+    toAmount: string; // Native token amount
+    swapQuote?: SwapQuote;
+  };
+  /** Tokens available for gas swap (with balances) */
+  availableForSwap?: Array<{
+    symbol: string;
+    balance: string;
+    balanceUsd: string;
+  }>;
+}
+
+/**
+ * Gas plan for a transaction (or batch of transactions)
+ * Includes any necessary pre-swap for gas
+ */
+export interface GasPlan {
+  /** Original transaction(s) to execute */
+  transactions: Array<{
+    description: string;
+    to: string;
+    data?: string;
+    value?: string;
+    estimatedGas: string;
+  }>;
+  /** Pre-swap transaction if needed for gas */
+  gasSwap?: {
+    quote: SwapQuote;
+    fromToken: string;
+    fromAmount: string;
+    toAmount: string;
+    description: string;
+  };
+  /** Total gas cost estimate (in native + USD) */
+  totalGasCost: {
+    native: string;
+    symbol: string;
+    usd: string;
+  };
+  /** Net cost deducted from user's token balance (for gas swap) */
+  netTokenCost?: {
+    token: string;
+    amount: string;
+    usd: string;
+  };
+  /** Summary message for the user */
+  summary: string;
+}
+
+// Preferred tokens to swap from for gas (in order of preference)
+const GAS_SWAP_PRIORITY = ["USDC", "USDT", "DAI", "WETH"];
+
+// Minimum gas buffer - add 30% to estimated gas cost
+const GAS_BUFFER_PERCENT = 30;
+
+/**
+ * Get native token balance for a chain
+ */
+export async function getNativeBalance(chain: SupportedChain): Promise<{
+  balance: string;
+  balanceRaw: bigint;
+  symbol: string;
+}> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  if (chain === "solana") {
+    // Handle Solana separately
+    const balances = await getBalances("solana");
+    return {
+      balance: balances[0]?.balance || "0",
+      balanceRaw: BigInt(Math.floor(parseFloat(balances[0]?.balance || "0") * 1e9)),
+      symbol: "SOL",
+    };
+  }
+
+  const config = CHAIN_CONFIG[chain];
+  const symbol = chain === "polygon" ? "MATIC" : "ETH";
+
+  try {
+    const response = await fetch(config.rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "eth_getBalance",
+        params: [session.address, "latest"],
+        id: 1,
+      }),
+    });
+
+    const data = (await response.json()) as { result?: string };
+    const balanceRaw = BigInt(data.result || "0");
+    const balance = (Number(balanceRaw) / 1e18).toFixed(6);
+
+    return { balance, balanceRaw, symbol };
+  } catch (error) {
+    console.error(`[clara] Error getting native balance on ${chain}:`, error);
+    return { balance: "0", balanceRaw: 0n, symbol };
+  }
+}
+
+/**
+ * Get current gas price for a chain
+ * Returns gas price in wei and gwei
+ */
+export async function getGasPrice(chain: SupportedChain): Promise<{
+  gasPriceWei: bigint;
+  gasPriceGwei: number;
+}> {
+  if (chain === "solana") {
+    // Solana uses different fee model
+    return { gasPriceWei: 5000n, gasPriceGwei: 0 };
+  }
+
+  const config = CHAIN_CONFIG[chain];
+
+  try {
+    const response = await fetch(config.rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "eth_gasPrice",
+        params: [],
+        id: 1,
+      }),
+    });
+
+    const data = (await response.json()) as { result?: string };
+    const gasPriceWei = BigInt(data.result || "1000000000"); // Default 1 gwei
+    const gasPriceGwei = Number(gasPriceWei) / 1e9;
+
+    return { gasPriceWei, gasPriceGwei };
+  } catch (error) {
+    console.error(`[clara] Error getting gas price on ${chain}:`, error);
+    // Default fallback: 30 gwei
+    return { gasPriceWei: 30000000000n, gasPriceGwei: 30 };
+  }
+}
+
+/**
+ * Check if user has enough gas for a transaction
+ * If not, returns details about which tokens can be swapped for gas
+ */
+export async function checkGasForTransaction(
+  chain: SupportedChain,
+  estimatedGasUnits: bigint | number = 100000n
+): Promise<GasCheckResult> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  // Get native balance and gas price
+  const [nativeBalanceResult, gasPriceResult] = await Promise.all([
+    getNativeBalance(chain),
+    getGasPrice(chain),
+  ]);
+
+  const { balance: nativeBalance, balanceRaw, symbol: nativeSymbol } = nativeBalanceResult;
+  const { gasPriceWei } = gasPriceResult;
+
+  // Calculate estimated gas cost with buffer
+  const gasUnits = typeof estimatedGasUnits === 'number' ? BigInt(estimatedGasUnits) : estimatedGasUnits;
+  const baseCost = gasUnits * gasPriceWei;
+  const bufferedCost = (baseCost * BigInt(100 + GAS_BUFFER_PERCENT)) / 100n;
+
+  const estimatedGasCost = (Number(bufferedCost) / 1e18).toFixed(6);
+
+  // Get ETH price for USD conversion
+  const prices = await fetchPrices();
+  const ethPrice = prices["ethereum"]?.usd || 3000;
+  const estimatedGasUsd = (Number(bufferedCost) / 1e18 * ethPrice).toFixed(2);
+
+  // Check if user has enough
+  const hasEnoughGas = balanceRaw >= bufferedCost;
+
+  if (hasEnoughGas) {
+    return {
+      hasEnoughGas: true,
+      nativeBalance,
+      nativeSymbol,
+      estimatedGasCost,
+      estimatedGasUsd,
+    };
+  }
+
+  // User doesn't have enough gas - find tokens to swap
+  console.error(`[clara] Insufficient gas on ${chain}. Need ${estimatedGasCost} ${nativeSymbol}, have ${nativeBalance}`);
+
+  // Check balances of preferred tokens
+  const availableForSwap: GasCheckResult["availableForSwap"] = [];
+
+  for (const tokenSymbol of GAS_SWAP_PRIORITY) {
+    const tokenInfo = POPULAR_TOKENS[tokenSymbol]?.[chain];
+    if (!tokenInfo) continue;
+
+    try {
+      const tokenBalance = await getTokenBalance(tokenInfo.address, chain);
+      const balanceNum = parseFloat(tokenBalance.balance);
+
+      if (balanceNum > 0) {
+        // Get USD value (stablecoins ~$1, WETH ~ethPrice)
+        const priceUsd = STABLE_TOKENS.has(tokenSymbol) ? 1 : ethPrice;
+        const balanceUsd = (balanceNum * priceUsd).toFixed(2);
+
+        availableForSwap.push({
+          symbol: tokenSymbol,
+          balance: tokenBalance.balance,
+          balanceUsd,
+        });
+      }
+    } catch (error) {
+      console.error(`[clara] Error checking ${tokenSymbol} balance:`, error);
+    }
+  }
+
+  // Calculate how much gas is needed (what we're short)
+  const shortfall = bufferedCost - balanceRaw;
+  const shortfallNative = (Number(shortfall) / 1e18).toFixed(6);
+  const shortfallUsd = (Number(shortfall) / 1e18 * ethPrice).toFixed(2);
+
+  // Find best token to swap from
+  let suggestedSwap: GasCheckResult["suggestedSwap"] | undefined;
+
+  if (availableForSwap.length > 0) {
+    // Pick first available token with sufficient balance
+    for (const token of availableForSwap) {
+      const tokenBalanceUsd = parseFloat(token.balanceUsd);
+      const neededUsd = parseFloat(shortfallUsd) * 1.1; // Add 10% buffer for slippage
+
+      if (tokenBalanceUsd >= neededUsd) {
+        // Calculate amount to swap
+        const priceUsd = STABLE_TOKENS.has(token.symbol) ? 1 : ethPrice;
+        const fromAmount = (neededUsd / priceUsd).toFixed(token.symbol === "WETH" ? 6 : 2);
+
+        suggestedSwap = {
+          fromToken: token.symbol,
+          fromAmount,
+          fromAmountUsd: neededUsd.toFixed(2),
+          toAmount: shortfallNative,
+        };
+
+        // Try to get an actual quote
+        try {
+          const quote = await getSwapQuote(token.symbol, "ETH", fromAmount, chain);
+          suggestedSwap.swapQuote = quote;
+          suggestedSwap.toAmount = quote.toAmount;
+        } catch (error) {
+          console.error(`[clara] Could not get swap quote:`, error);
+        }
+
+        break;
+      }
+    }
+  }
+
+  return {
+    hasEnoughGas: false,
+    nativeBalance,
+    nativeSymbol,
+    estimatedGasCost,
+    estimatedGasUsd,
+    suggestedSwap,
+    availableForSwap,
+  };
+}
+
+/**
+ * Create a gas plan for a transaction
+ * Automatically includes swap-for-gas step if needed
+ */
+export async function createGasPlan(
+  chain: SupportedChain,
+  transactions: Array<{
+    description: string;
+    to: string;
+    data?: string;
+    value?: string;
+  }>
+): Promise<GasPlan> {
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  // Estimate gas for all transactions
+  let totalGasUnits = 0n;
+  const txsWithGas: GasPlan["transactions"] = [];
+
+  for (const tx of transactions) {
+    const gasEstimate = await estimateGas(
+      { to: tx.to, data: tx.data, value: tx.value },
+      chain
+    );
+
+    const gasUnits = BigInt(gasEstimate.gasLimit);
+    totalGasUnits += gasUnits;
+
+    txsWithGas.push({
+      ...tx,
+      estimatedGas: gasEstimate.gasLimit,
+    });
+  }
+
+  // Check if user has enough gas
+  const gasCheck = await checkGasForTransaction(chain, totalGasUnits);
+
+  // Get native token symbol
+  const nativeSymbol = chain === "polygon" ? "MATIC" : "ETH";
+
+  // Build the plan
+  const plan: GasPlan = {
+    transactions: txsWithGas,
+    totalGasCost: {
+      native: gasCheck.estimatedGasCost,
+      symbol: nativeSymbol,
+      usd: gasCheck.estimatedGasUsd,
+    },
+    summary: "",
+  };
+
+  if (gasCheck.hasEnoughGas) {
+    plan.summary = `Ready to execute ${transactions.length} transaction(s). Gas: ~$${gasCheck.estimatedGasUsd}`;
+  } else if (gasCheck.suggestedSwap?.swapQuote) {
+    // Need to swap for gas first
+    plan.gasSwap = {
+      quote: gasCheck.suggestedSwap.swapQuote,
+      fromToken: gasCheck.suggestedSwap.fromToken,
+      fromAmount: gasCheck.suggestedSwap.fromAmount,
+      toAmount: gasCheck.suggestedSwap.toAmount,
+      description: `Swap ${gasCheck.suggestedSwap.fromAmount} ${gasCheck.suggestedSwap.fromToken} → ${gasCheck.suggestedSwap.toAmount} ${nativeSymbol} for gas`,
+    };
+
+    plan.netTokenCost = {
+      token: gasCheck.suggestedSwap.fromToken,
+      amount: gasCheck.suggestedSwap.fromAmount,
+      usd: gasCheck.suggestedSwap.fromAmountUsd,
+    };
+
+    plan.summary = `Insufficient ${nativeSymbol} for gas. Will swap ~$${gasCheck.suggestedSwap.fromAmountUsd} of ${gasCheck.suggestedSwap.fromToken} to cover gas costs.`;
+  } else {
+    // No tokens available to swap
+    const availableTokens = gasCheck.availableForSwap?.map(t => t.symbol).join(", ") || "none";
+    plan.summary = `Insufficient ${nativeSymbol} for gas. Available tokens to swap: ${availableTokens}. Please add more funds.`;
+  }
+
+  return plan;
+}
+
+/**
+ * Execute a gas plan (including any necessary swap-for-gas)
+ * Returns transaction hashes for all executed transactions
+ */
+export async function executeGasPlan(
+  plan: GasPlan,
+  chain: SupportedChain
+): Promise<Array<{ description: string; txHash: string; status: string }>> {
+  const results: Array<{ description: string; txHash: string; status: string }> = [];
+
+  // Step 1: Execute gas swap if needed
+  if (plan.gasSwap && plan.gasSwap.quote) {
+    console.error(`[clara] Executing gas swap: ${plan.gasSwap.description}`);
+
+    try {
+      const swapResult = await executeSwap(plan.gasSwap.quote, chain);
+      results.push({
+        description: plan.gasSwap.description,
+        txHash: swapResult.txHash,
+        status: "completed",
+      });
+
+      // Wait a moment for the swap to settle
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    } catch (error) {
+      console.error(`[clara] Gas swap failed:`, error);
+      results.push({
+        description: plan.gasSwap.description,
+        txHash: "",
+        status: "failed",
+      });
+      throw new Error(`Gas swap failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  // Step 2: Execute main transactions
+  for (const tx of plan.transactions) {
+    console.error(`[clara] Executing: ${tx.description}`);
+
+    try {
+      const txResult = await sendTransaction(
+        tx.to,
+        tx.value || "0",
+        chain,
+        undefined,
+        tx.data
+      );
+
+      results.push({
+        description: tx.description,
+        txHash: txResult.txHash,
+        status: "pending",
+      });
+    } catch (error) {
+      console.error(`[clara] Transaction failed:`, error);
+      results.push({
+        description: tx.description,
+        txHash: "",
+        status: "failed",
+      });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Quick helper: Ensure gas is available for a simple transaction
+ * Returns true if ready, or details about what's needed
+ */
+export async function ensureGas(
+  chain: SupportedChain,
+  estimatedGasUnits: number = 100000
+): Promise<{ ready: boolean; message: string; swapNeeded?: SwapQuote }> {
+  const gasCheck = await checkGasForTransaction(chain, BigInt(estimatedGasUnits));
+
+  if (gasCheck.hasEnoughGas) {
+    return { ready: true, message: "Gas available" };
+  }
+
+  if (gasCheck.suggestedSwap?.swapQuote) {
+    return {
+      ready: false,
+      message: `Need to swap ${gasCheck.suggestedSwap.fromAmount} ${gasCheck.suggestedSwap.fromToken} for gas`,
+      swapNeeded: gasCheck.suggestedSwap.swapQuote,
+    };
+  }
+
+  return {
+    ready: false,
+    message: `Insufficient gas and no tokens available to swap. Add ${gasCheck.nativeSymbol} or stablecoins.`,
+  };
+}

@@ -29,12 +29,24 @@ This breaks wallets. Browser extensions assume a browser. Hardware wallets assum
 "Transfer 50 USDC to 0x..."
 ```
 
-**DeFi Operations**
+**Token Swaps**
 ```
-"Deposit 1 ETH into Aave for yield"
-"Swap 100 USDC for ETH on Uniswap"
-"Check my staking rewards"
+"Swap 0.1 ETH for USDC on Base"      → Best price across DEXs
+"How much DAI for 1 ETH?"            → Get a quote
+"Swap 100 USDC for WETH on Arbitrum" → Execute the trade
 ```
+
+Powered by Li.Fi aggregation across Uniswap, Sushiswap, Curve, and more.
+
+**Yield Earning (NEW)**
+```
+"Earn yield on my USDC"           → Finds best APY across Base & Arbitrum
+"Deposit 100 USDC for yield"      → Creates plan, deposits to Aave v3
+"Show my yield positions"         → Lists your current deposits
+"Withdraw my USDC from Aave"      → Withdraws from protocol
+```
+
+Powered by DeFiLlama for yield discovery + Aave v3 for deposits. Clara automatically routes to the highest APY.
 
 **Developer Workflows**
 ```
@@ -60,6 +72,31 @@ This breaks wallets. Browser extensions assume a browser. Hardware wallets assum
 "What do I own?"                  → Shows all balances + USD values
 "Show my portfolio"               → Multi-chain overview with 24h changes
 ```
+
+**ERC-20 Token Transfers**
+```
+"Send 100 USDC to 0x..."         → Sends USDC on any supported chain
+"What's my USDC balance?"        → Check specific token balance
+"Transfer 50 DAI to vitalik.eth" → Combine ENS + token transfers
+```
+
+Supported tokens: USDC, USDT, DAI, WETH, WBTC (or any contract address)
+
+**Transaction History**
+```
+"Show my recent transactions on Base"
+"What did I do on Ethereum?"
+"Show my last 20 transactions on Arbitrum"
+```
+
+**Token Approvals**
+```
+"Show my token approvals on Ethereum"   → Lists all active spending permissions
+"Check my USDC approval for Uniswap"    → Check specific approval
+"Revoke USDC approval for 0x7a250d..."  → Remove spending permission
+```
+
+Approvals let DeFi protocols spend your tokens. Unlimited approvals can be risky if protocols are compromised. Clara helps you view and revoke them.
 
 ---
 
@@ -177,9 +214,15 @@ One wallet setup creates both an EVM address (works across all EVM chains) and a
 | `wallet_get_balance` | Check token balances |
 | `wallet_sign_message` | Sign messages (SIWE, etc.) |
 | `wallet_sign_transaction` | Sign transactions |
-| `wallet_send` | Send tokens (supports ENS names) |
+| `wallet_send` | Send native or ERC-20 tokens (supports ENS) |
+| `wallet_token_balance` | Check ERC-20 token balances |
 | `wallet_resolve_ens` | Resolve ENS names ↔ addresses |
 | `wallet_portfolio` | View portfolio with USD values |
+| `wallet_simulate` | Preview transactions before signing |
+| `wallet_history` | View transaction history |
+| `wallet_approvals` | View and revoke token spending permissions |
+| `wallet_swap` | Swap tokens via DEX aggregation (Li.Fi) |
+| `wallet_earn` | Earn yield via lending protocols (Aave v3) |
 | `wallet_logout` | Clear local session |
 
 ---
@@ -194,14 +237,15 @@ One wallet setup creates both an EVM address (works across all EVM chains) and a
 - All signing requires explicit approval
 - Full transaction details shown before signing
 - Amount, recipient, and gas estimates displayed
+- Transaction simulation detects potential failures and risky approvals
 
 ---
 
 ## Current Limitations
 
-- **ERC-20 transfers** — Balance checks supported, transfers coming soon
-- **SPL tokens** — Not yet supported
+- **SPL tokens (Solana)** — Not yet supported
 - **Complex DeFi** — Basic patterns supported, advanced interactions in development
+- **NFT transfers** — Coming soon
 
 ---
 

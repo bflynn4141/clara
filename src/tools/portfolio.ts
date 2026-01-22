@@ -7,7 +7,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getSession } from "../storage/session.js";
-import { getPortfolio, formatUsd, formatChange, reverseResolveEns } from "../para/client.js";
+import { getPortfolioFast, formatUsd, formatChange, reverseResolveEns } from "../para/client.js";
 
 export function registerPortfolioTool(server: McpServer) {
   server.registerTool(
@@ -36,7 +36,7 @@ export function registerPortfolioTool(server: McpServer) {
           };
         }
 
-        const portfolio = await getPortfolio();
+        const portfolio = await getPortfolioFast();
 
         // Filter out zero balances unless showEmpty is true
         const items = showEmpty
@@ -99,7 +99,7 @@ export function registerPortfolioTool(server: McpServer) {
 
         footer.push(`└─────────────────────────────────────────────────────────────┘`);
 
-        // Add last updated timestamp
+        // Add timestamp - now shows real-time via Multicall3
         const updatedTime = new Date(portfolio.lastUpdated).toLocaleTimeString();
 
         const output = [
@@ -107,7 +107,7 @@ export function registerPortfolioTool(server: McpServer) {
           ...chainRows,
           ...footer,
           ``,
-          `Last updated: ${updatedTime}`,
+          `⚡ Real-time balances as of ${updatedTime}`,
         ].join("\n");
 
         return {

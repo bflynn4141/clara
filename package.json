@@ -15,6 +15,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "tsx scripts/integration-test.ts",
+    "test:yield-integration": "tsx scripts/yield-integration-test.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

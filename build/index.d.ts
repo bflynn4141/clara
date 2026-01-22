@@ -16,6 +16,9 @@
  * - wallet_logout: Clear local session
  * - wallet_resolve_ens: Resolve ENS names to addresses
  * - wallet_portfolio: View portfolio across all chains
+ * - wallet_simulate: Preview what a transaction will do
+ * - wallet_token_balance: Check ERC-20 token balances
+ * - wallet_history: View transaction history
  */
 export {};
 //# sourceMappingURL=index.d.ts.map
