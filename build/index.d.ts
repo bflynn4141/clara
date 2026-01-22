@@ -14,6 +14,7 @@
  * - wallet_sign_transaction: Sign transactions (requires approval)
  * - wallet_send: Send tokens (requires approval)
  * - wallet_logout: Clear local session
+ * - wallet_resolve_ens: Resolve ENS names to addresses
  */
 export {};
 //# sourceMappingURL=index.d.ts.map

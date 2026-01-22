@@ -1,0 +1,111 @@
+/**
+ * wallet_resolve_ens - Resolve ENS names to addresses and vice versa
+ */
+
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { resolveEnsName, reverseResolveEns, isEnsName } from "../para/client.js";
+
+export function registerResolveEnsTool(server: McpServer) {
+  server.registerTool(
+    "wallet_resolve_ens",
+    {
+      description: "Resolve an ENS name (like vitalik.eth) to an Ethereum address, or look up the ENS name for an address. Works with .eth, .xyz, .com, and other ENS-supported domains.",
+      inputSchema: {
+        input: z.string()
+          .describe("ENS name (e.g., 'vitalik.eth') or Ethereum address (e.g., '0xd8dA6BF...')"),
+      },
+    },
+    async (args) => {
+      const { input } = args;
+
+      if (!input) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `❌ Please provide an ENS name or Ethereum address to resolve.`
+          }]
+        };
+      }
+
+      try {
+        // Determine if this is a forward or reverse lookup
+        const isAddress = input.startsWith("0x") && input.length === 42;
+
+        if (isAddress) {
+          // Reverse lookup: address -> ENS name
+          const ensName = await reverseResolveEns(input);
+
+          if (ensName) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: `🏷️ ENS Lookup\n\n` +
+                  `Address: ${input}\n` +
+                  `ENS Name: ${ensName}\n\n` +
+                  `✓ This address has a primary ENS name set.`
+              }]
+            };
+          } else {
+            return {
+              content: [{
+                type: "text" as const,
+                text: `🏷️ ENS Lookup\n\n` +
+                  `Address: ${input}\n` +
+                  `ENS Name: (none)\n\n` +
+                  `ℹ️ This address does not have a primary ENS name configured.`
+              }]
+            };
+          }
+        }
+
+        // Forward lookup: ENS name -> address
+        if (!isEnsName(input)) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `❌ "${input}" doesn't look like an ENS name.\n\n` +
+                `ENS names end with .eth, .xyz, .com, .org, .io, or .app\n` +
+                `Examples: vitalik.eth, uniswap.eth, opensea.eth`
+            }]
+          };
+        }
+
+        const address = await resolveEnsName(input);
+
+        if (address) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `🏷️ ENS Resolution\n\n` +
+                `Name: ${input}\n` +
+                `Address: ${address}\n\n` +
+                `✓ You can send tokens to "${input}" and it will go to this address.`
+            }]
+          };
+        } else {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `❌ Could not resolve "${input}"\n\n` +
+                `Possible reasons:\n` +
+                `• The name is not registered\n` +
+                `• The name exists but has no address set\n` +
+                `• Network connectivity issue\n\n` +
+                `Try checking on https://app.ens.domains/name/${input}`
+            }]
+          };
+        }
+
+      } catch (error) {
+        console.error("wallet_resolve_ens error:", error);
+        return {
+          content: [{
+            type: "text" as const,
+            text: `❌ Error resolving ENS: ${error instanceof Error ? error.message : "Unknown error"}`
+          }]
+        };
+      }
+    }
+  );
+}

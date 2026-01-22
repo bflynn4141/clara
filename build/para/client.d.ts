@@ -1,14 +1,13 @@
 /**
- * Para SDK Client
+ * Para REST API Client
  *
- * Uses Para's pregenerated wallets for CLI-native wallet creation.
- * MPC (Multi-Party Computation) ensures keys are never stored in one place.
+ * Uses Para's REST API for wallet creation and signing.
+ * Supports routing through a proxy (for API key injection).
  *
  * Flow:
- * 1. Create pregen wallet for email (no browser auth needed)
- * 2. Store encrypted user share locally
- * 3. Sign messages/transactions using stored share
- * 4. User can optionally claim wallet later via browser
+ * 1. Create wallet via REST API (EVM and/or Solana)
+ * 2. Store wallet ID locally
+ * 3. Sign messages/transactions via REST API
  */
 export interface TokenBalance {
     symbol: string;
@@ -36,18 +35,30 @@ declare const CHAIN_CONFIG: Record<SupportedChain, {
     rpcUrl: string;
 }>;
 /**
- * Identifier types supported by Para pregen wallets
+ * Resolve ENS name to Ethereum address
+ * Works with .eth names on Ethereum mainnet
+ */
+export declare function resolveEnsName(name: string): Promise<string | null>;
+/**
+ * Reverse resolve: get ENS name for an Ethereum address
+ */
+export declare function reverseResolveEns(address: string): Promise<string | null>;
+/**
+ * Check if a string looks like an ENS name
+ */
+export declare function isEnsName(input: string): boolean;
+/**
+ * Identifier types supported by Para wallets
  */
 export type PregenIdentifier = {
-    type: 'email';
+    type: "email";
     value: string;
 } | {
-    type: 'customId';
+    type: "customId";
     value: string;
 };
 /**
- * Create pregen wallet with flexible identifier
- * Supports: email (portable) or customId (zero-friction)
+ * Create wallet via Para REST API
  * Creates both EVM and Solana wallets for full multi-chain support
  */
 export declare function createPregenWallet(identifier: PregenIdentifier): Promise<{
@@ -62,7 +73,7 @@ export declare function startEmailAuth(email: string): Promise<{
 }>;
 /**
  * Legacy wrapper for OTP verification (backward compatibility)
- * OTP parameter is ignored - pregen wallets don't need verification
+ * OTP parameter is ignored - REST API wallets don't need verification
  */
 export declare function verifyEmailOTP(sessionId: string, _otp: string): Promise<{
     address: string;
@@ -71,7 +82,6 @@ export declare function verifyEmailOTP(sessionId: string, _otp: string): Promise
 }>;
 /**
  * Complete wallet setup and retrieve wallet info
- * For pregen wallets, this retrieves the already-created wallet
  */
 export declare function completeWalletSetup(sessionId: string): Promise<{
     address: string;
@@ -84,11 +94,11 @@ export declare function completeWalletSetup(sessionId: string): Promise<{
 export declare function getWalletAddress(chain: SupportedChain): Promise<string>;
 /**
  * Get token balances for a chain
- * Note: Para doesn't provide balance APIs - we use RPC directly
  */
 export declare function getBalances(chain: SupportedChain, _tokenAddress?: string): Promise<TokenBalance[]>;
 /**
- * Sign an arbitrary message using Para MPC
+ * Sign an arbitrary message using Para REST API
+ * Uses the /sign-raw endpoint which accepts 0x-prefixed hex data
  */
 export declare function signMessage(message: string, chain?: SupportedChain): Promise<string>;
 /**
@@ -101,19 +111,11 @@ export interface SolanaTransactionRequest {
     serializedTx?: string;
 }
 /**
- * Sign a transaction (does not broadcast)
- *
- * For EVM: Para SDK requires RLP-encoded transactions in base64.
- * For Solana: Expects serialized transaction in base64 or builds a simple transfer.
- *
- * For production use, integrate with ethers.js/viem (EVM) or @solana/web3.js (Solana).
+ * Sign a transaction using Para REST API
  */
 export declare function signTransaction(tx: TransactionRequest | SolanaTransactionRequest, chain: SupportedChain): Promise<SignedTransaction>;
 /**
  * Send tokens (sign + broadcast)
- *
- * For Solana: Signs intent and provides instructions for manual broadcast
- * (full Solana tx building requires @solana/web3.js)
  */
 export declare function sendTransaction(to: string, amount: string, chain: SupportedChain, _tokenAddress?: string): Promise<{
     txHash: string;

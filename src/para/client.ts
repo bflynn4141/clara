@@ -11,6 +11,7 @@
  */
 
 import { getSession, updateSession } from "../storage/session.js";
+import { keccak_256 } from "@noble/hashes/sha3.js";
 
 // Types
 export interface TokenBalance {
@@ -57,6 +58,202 @@ const CHAIN_CONFIG: Record<SupportedChain, { name: string; chainId?: number; rpc
 // Default: Uses Clara proxy which injects API key
 // Override with PARA_API_URL env var for direct API access with your own key
 const PARA_API_BASE = process.env.PARA_API_URL || "https://clara-proxy.bflynn-me.workers.dev/api";
+
+// ENS Contract Addresses (Ethereum Mainnet)
+const ENS_REGISTRY = "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e";
+
+/**
+ * Compute ENS namehash for a domain name
+ * namehash('') = 0x0000...0000
+ * namehash('eth') = keccak256(namehash('') + keccak256('eth'))
+ * namehash('vitalik.eth') = keccak256(namehash('eth') + keccak256('vitalik'))
+ */
+function namehash(name: string): string {
+  if (!name) {
+    return "0x" + "00".repeat(32);
+  }
+
+  const labels = name.split(".");
+  let node: Uint8Array = new Uint8Array(32); // Start with 32 zero bytes
+
+  for (let i = labels.length - 1; i >= 0; i--) {
+    const labelHash = keccak_256(new TextEncoder().encode(labels[i]));
+    const combined = new Uint8Array(64);
+    combined.set(node, 0);
+    combined.set(new Uint8Array(labelHash), 32);
+    node = new Uint8Array(keccak_256(combined));
+  }
+
+  return "0x" + Buffer.from(node).toString("hex");
+}
+
+/**
+ * Resolve ENS name to Ethereum address
+ * Works with .eth names on Ethereum mainnet
+ */
+export async function resolveEnsName(name: string): Promise<string | null> {
+  // Only resolve names that look like ENS
+  if (!name.includes(".") || name.startsWith("0x")) {
+    return null;
+  }
+
+  // Normalize the name
+  const normalizedName = name.toLowerCase().trim();
+  console.error(`[clara] Resolving ENS: ${normalizedName}`);
+
+  const config = CHAIN_CONFIG["ethereum"];
+  const node = namehash(normalizedName);
+
+  try {
+    // Step 1: Get the resolver address from ENS Registry
+    // resolver(bytes32 node) -> address
+    const resolverSelector = "0178b8bf"; // keccak256('resolver(bytes32)')[:4]
+    const resolverCalldata = "0x" + resolverSelector + node.slice(2);
+
+    const resolverResponse = await fetch(config.rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "eth_call",
+        params: [{ to: ENS_REGISTRY, data: resolverCalldata }, "latest"],
+        id: 1,
+      }),
+    });
+
+    const resolverData = (await resolverResponse.json()) as { result?: string; error?: { message: string } };
+
+    if (resolverData.error || !resolverData.result || resolverData.result === "0x" + "00".repeat(32)) {
+      console.error(`[clara] No resolver found for ${normalizedName}`);
+      return null;
+    }
+
+    // Extract resolver address (last 20 bytes of the 32-byte response)
+    const resolverAddress = "0x" + resolverData.result.slice(-40);
+    console.error(`[clara] Found resolver: ${resolverAddress}`);
+
+    // Step 2: Get the address from the resolver
+    // addr(bytes32 node) -> address
+    const addrSelector = "3b3b57de"; // keccak256('addr(bytes32)')[:4]
+    const addrCalldata = "0x" + addrSelector + node.slice(2);
+
+    const addrResponse = await fetch(config.rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "eth_call",
+        params: [{ to: resolverAddress, data: addrCalldata }, "latest"],
+        id: 2,
+      }),
+    });
+
+    const addrData = (await addrResponse.json()) as { result?: string; error?: { message: string } };
+
+    if (addrData.error || !addrData.result || addrData.result === "0x" + "00".repeat(32)) {
+      console.error(`[clara] No address found for ${normalizedName}`);
+      return null;
+    }
+
+    // Extract address (last 20 bytes)
+    const address = "0x" + addrData.result.slice(-40);
+    console.error(`[clara] Resolved ${normalizedName} -> ${address}`);
+
+    return address;
+  } catch (error) {
+    console.error(`[clara] ENS resolution error:`, error);
+    return null;
+  }
+}
+
+/**
+ * Reverse resolve: get ENS name for an Ethereum address
+ */
+export async function reverseResolveEns(address: string): Promise<string | null> {
+  if (!address.startsWith("0x") || address.length !== 42) {
+    return null;
+  }
+
+  // Reverse resolution uses {address}.addr.reverse
+  const reverseName = address.slice(2).toLowerCase() + ".addr.reverse";
+  const node = namehash(reverseName);
+  const config = CHAIN_CONFIG["ethereum"];
+
+  try {
+    // Get resolver for reverse record
+    const resolverSelector = "0178b8bf";
+    const resolverCalldata = "0x" + resolverSelector + node.slice(2);
+
+    const resolverResponse = await fetch(config.rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "eth_call",
+        params: [{ to: ENS_REGISTRY, data: resolverCalldata }, "latest"],
+        id: 1,
+      }),
+    });
+
+    const resolverData = (await resolverResponse.json()) as { result?: string };
+
+    if (!resolverData.result || resolverData.result === "0x" + "00".repeat(32)) {
+      return null;
+    }
+
+    const resolverAddress = "0x" + resolverData.result.slice(-40);
+
+    // Call name(bytes32) on resolver
+    const nameSelector = "691f3431"; // keccak256('name(bytes32)')[:4]
+    const nameCalldata = "0x" + nameSelector + node.slice(2);
+
+    const nameResponse = await fetch(config.rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "eth_call",
+        params: [{ to: resolverAddress, data: nameCalldata }, "latest"],
+        id: 2,
+      }),
+    });
+
+    const nameData = (await nameResponse.json()) as { result?: string };
+
+    if (!nameData.result || nameData.result === "0x") {
+      return null;
+    }
+
+    // Decode the string result (ABI-encoded string)
+    const hex = nameData.result.slice(2);
+    // Skip offset (32 bytes) and length (32 bytes), then decode
+    const lengthHex = hex.slice(64, 128);
+    const length = parseInt(lengthHex, 16);
+    const nameHex = hex.slice(128, 128 + length * 2);
+    const name = Buffer.from(nameHex, "hex").toString("utf8");
+
+    console.error(`[clara] Reverse resolved ${address} -> ${name}`);
+    return name || null;
+  } catch (error) {
+    console.error(`[clara] Reverse ENS resolution error:`, error);
+    return null;
+  }
+}
+
+/**
+ * Check if a string looks like an ENS name
+ */
+export function isEnsName(input: string): boolean {
+  if (!input || input.startsWith("0x")) return false;
+  return input.includes(".") && (
+    input.endsWith(".eth") ||
+    input.endsWith(".xyz") ||
+    input.endsWith(".com") ||
+    input.endsWith(".org") ||
+    input.endsWith(".io") ||
+    input.endsWith(".app")
+  );
+}
 
 /**
  * Make authenticated request to Para API

@@ -7,7 +7,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getSession } from "../storage/session.js";
-import { sendTransaction, estimateGas } from "../para/client.js";
+import { sendTransaction, estimateGas, resolveEnsName, isEnsName } from "../para/client.js";
 
 const SUPPORTED_CHAINS = ["ethereum", "base", "arbitrum", "optimism", "polygon", "solana"] as const;
 
@@ -15,9 +15,9 @@ export function registerSendTool(server: McpServer) {
   server.registerTool(
     "wallet_send",
     {
-      description: "Send native tokens or ERC-20/SPL tokens to an address. REQUIRES USER APPROVAL.",
+      description: "Send native tokens or ERC-20/SPL tokens to an address or ENS name (like vitalik.eth). REQUIRES USER APPROVAL.",
       inputSchema: {
-        to: z.string().describe("Recipient address"),
+        to: z.string().describe("Recipient address or ENS name (e.g., '0x...' or 'vitalik.eth')"),
         amount: z.string().describe("Amount to send (e.g., '0.1' for 0.1 ETH)"),
         chain: z.enum(SUPPORTED_CHAINS).describe("Blockchain to send on"),
         token: z.string().optional().describe("Token contract address (optional, defaults to native)"),
@@ -38,8 +38,30 @@ export function registerSendTool(server: McpServer) {
           };
         }
 
+        // Resolve ENS name if applicable (only for EVM chains)
+        let resolvedTo = to;
+        let ensName: string | null = null;
+
+        if (chain !== "solana" && isEnsName(to)) {
+          ensName = to;
+          const resolved = await resolveEnsName(to);
+
+          if (!resolved) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: `❌ Could not resolve ENS name "${to}"\n\n` +
+                  `The name may not be registered or doesn't have an address set.\n` +
+                  `Check: https://app.ens.domains/name/${to}`
+              }]
+            };
+          }
+
+          resolvedTo = resolved;
+        }
+
         // Estimate gas
-        const gasEstimate = await estimateGas({ to, value: amount }, chain);
+        const gasEstimate = await estimateGas({ to: resolvedTo, value: amount }, chain);
         const tokenSymbol = token ? "TOKEN" : getNativeSymbol(chain);
 
         // Build transaction details
@@ -47,7 +69,8 @@ export function registerSendTool(server: McpServer) {
           `┌─────────────────────────────────────`,
           `│ Send Transaction`,
           `│`,
-          `│ To: ${to}`,
+          ensName ? `│ To: ${ensName}` : null,
+          ensName ? `│     → ${resolvedTo}` : `│ To: ${resolvedTo}`,
           `│ Amount: ${amount} ${tokenSymbol}`,
           `│ Chain: ${chain}`,
           token ? `│ Token: ${token}` : null,
@@ -55,8 +78,8 @@ export function registerSendTool(server: McpServer) {
           `└─────────────────────────────────────`,
         ].filter(Boolean).join("\n");
 
-        // Execute send
-        const result = await sendTransaction(to, amount, chain, token);
+        // Execute send with resolved address
+        const result = await sendTransaction(resolvedTo, amount, chain, token);
 
         return {
           content: [{

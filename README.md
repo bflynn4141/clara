@@ -48,6 +48,13 @@ This breaks wallets. Browser extensions assume a browser. Hardware wallets assum
 "What's my address?" → Same wallet works on Ethereum, Base, Arbitrum, Optimism, Polygon, and Solana
 ```
 
+**ENS Support**
+```
+"Send 0.1 ETH to vitalik.eth"     → Resolves ENS name automatically
+"Who is vitalik.eth?"             → Shows the address
+"What's the ENS for 0xd8dA6B..."  → Reverse lookup
+```
+
 ---
 
 ## Quick Start
@@ -156,7 +163,8 @@ One wallet setup creates both an EVM address (works across all EVM chains) and a
 | `wallet_get_balance` | Check token balances |
 | `wallet_sign_message` | Sign messages (SIWE, etc.) |
 | `wallet_sign_transaction` | Sign transactions |
-| `wallet_send` | Send tokens |
+| `wallet_send` | Send tokens (supports ENS names) |
+| `wallet_resolve_ens` | Resolve ENS names ↔ addresses |
 | `wallet_logout` | Clear local session |
 
 ---

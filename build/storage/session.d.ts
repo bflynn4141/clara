@@ -14,11 +14,12 @@ export interface WalletSession {
     authenticated: boolean;
     address?: string;
     solanaAddress?: string;
+    walletId?: string;
+    solanaWalletId?: string;
     email?: string;
     identifierType?: 'email' | 'customId';
     identifier?: string;
     paraSessionToken?: string;
-    paraUserShare?: string;
     pendingEmail?: string;
     pendingIdentifier?: string;
     chains: string[];
