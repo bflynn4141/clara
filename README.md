@@ -95,7 +95,15 @@ Or install from GitHub:
 }
 ```
 
-### 2. Restart Claude Code
+### 2. Verify Installation (Optional)
+
+```bash
+npx clara-wallet
+# Should output: "Para Wallet MCP Server running on stdio"
+# Press Ctrl+C to exit
+```
+
+### 3. Restart Claude Code
 
 Close and reopen Claude Code to load the wallet.
 
