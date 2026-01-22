@@ -8,57 +8,141 @@ A wallet for Claude Code, powered by [Para](https://getpara.com).
 
 ---
 
-Users are moving from app-specific frontends to their own AI-powered clients. You don't go to a website—your assistant goes for you. When users interact with blockchains through their own clients, keys need to travel with them.
+## The Vision
 
-Clara is the first wallet built for this shift. Not a browser extension. Not an app. A capability that lives where the user already is.
+The interface is changing. Users are moving from app-specific frontends to their own AI-powered clients. You don't go to a website—your assistant goes for you.
+
+This breaks wallets. Browser extensions assume a browser. Hardware wallets assume a specific device. Keys are trapped in contexts that are disappearing.
+
+**Clara is the first wallet built for this shift.** Not a browser extension. Not an app. A capability that lives where the user already is.
 
 ---
 
-## Features
+## Use Cases
 
-- **Email-based setup** - No seed phrases, no browser extensions
-- **MPC Security** - Keys split across Para's infrastructure (never stored in one place)
-- **Multi-chain** - Ethereum, Base, Arbitrum, Optimism, Polygon (Solana coming soon)
-- **Persistent** - Wallet survives across sessions, stored encrypted locally
-- **Portable** - Same wallet accessible at getpara.com
+**Everyday Transactions**
+```
+"Send 0.1 ETH to vitalik.eth"
+"What's my balance on Base?"
+"Transfer 50 USDC to 0x..."
+```
+
+**DeFi Operations**
+```
+"Deposit 1 ETH into Aave for yield"
+"Swap 100 USDC for ETH on Uniswap"
+"Check my staking rewards"
+```
+
+**Developer Workflows**
+```
+"Deploy this contract to Base"
+"Sign this message to verify my identity"
+"Approve the token spend for this dApp"
+```
+
+**Cross-Chain Identity**
+```
+"What's my address?" → Same wallet works on Ethereum, Base, Arbitrum, Optimism, Polygon, and Solana
+```
+
+---
 
 ## Quick Start
 
-### 1. Get a Para API Key
-
-Sign up at [developer.getpara.com](https://developer.getpara.com) to get your API key.
-
-### 2. Install the MCP
+### 1. Install
 
 Add to your `~/.claude.json`:
 
 ```json
 {
   "mcpServers": {
-    "para-wallet": {
+    "clara-wallet": {
       "type": "stdio",
-      "command": "node",
-      "args": ["/path/to/para-wallet/build/index.js"],
-      "env": {
-        "PARA_API_KEY": "your-api-key-here"
-      }
+      "command": "npx",
+      "args": ["-y", "clara-wallet"]
     }
   }
 }
 ```
 
-### 3. Restart Claude Code
+Or install from GitHub:
 
-Close and reopen Claude Code to load the new MCP.
+```json
+{
+  "mcpServers": {
+    "clara-wallet": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "github:bflynn4141/clara"]
+    }
+  }
+}
+```
 
-### 4. Setup Your Wallet
+### 2. Restart Claude Code
+
+Close and reopen Claude Code to load the wallet.
+
+### 3. Setup Your Wallet
 
 ```
-You: setup my wallet with brian@example.com
+You: setup my wallet with me@example.com
 Claude: Check your email for a verification code!
 You: 123456
-Claude: ✓ Wallet setup complete! Your address is 0x...
+Claude: ✓ Wallet ready! Your address is 0x...
 ```
+
+That's it. No API keys. No seed phrases. No browser extensions.
+
+---
+
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| **Email-based setup** | Verify with OTP, no seed phrases |
+| **MPC Security** | Keys split across infrastructure, never in one place |
+| **Multi-chain** | Ethereum, Base, Arbitrum, Optimism, Polygon, Solana |
+| **Persistent** | Wallet survives across sessions |
+| **Portable** | Access the same wallet at [getpara.com](https://getpara.com) |
+| **Context-aware** | Claude understands what it's signing |
+
+---
+
+## How It Works
+
+### MPC (Multi-Party Computation)
+
+Your keys are never stored in one place:
+
+1. **Key Generation** — Cryptographic keys generated across multiple parties
+2. **Your Share** — Stored encrypted locally on your machine
+3. **Para's Share** — Held on Para's infrastructure
+4. **Signing** — Both shares collaborate (neither can sign alone)
+
+This means: no single point of failure, no exposed private keys, you maintain custody.
+
+### Why This Matters
+
+Traditional wallets force a choice: convenience (hot wallets) or security (hardware wallets). MPC eliminates this tradeoff—keys that are both accessible and secure.
+
+---
+
+## Supported Chains
+
+| Chain | Type | Native Token |
+|-------|------|--------------|
+| Ethereum | EVM | ETH |
+| Base | EVM | ETH |
+| Arbitrum | EVM | ETH |
+| Optimism | EVM | ETH |
+| Polygon | EVM | MATIC |
+| Solana | Ed25519 | SOL |
+
+One wallet setup creates both an EVM address (works across all EVM chains) and a Solana address.
+
+---
 
 ## Available Tools
 
@@ -73,104 +157,37 @@ Claude: ✓ Wallet setup complete! Your address is 0x...
 | `wallet_send` | Send tokens |
 | `wallet_logout` | Clear local session |
 
-## Supported Chains
-
-### EVM Chains (secp256k1)
-| Chain | Chain ID | Native Token |
-|-------|----------|--------------|
-| Ethereum | 1 | ETH |
-| Base | 8453 | ETH |
-| Arbitrum | 42161 | ETH |
-| Optimism | 10 | ETH |
-| Polygon | 137 | MATIC |
-
-### Solana (Ed25519)
-| Chain | Network | Native Token |
-|-------|---------|--------------|
-| Solana | Mainnet | SOL |
-
-Both wallets are created automatically during setup - one EVM address (works across all EVM chains) and one Solana address.
-
-## How It Works
-
-### MPC (Multi-Party Computation)
-
-Para uses MPC to secure your wallet:
-
-1. **Key Generation** - Cryptographic keys are generated across multiple parties
-2. **User Share** - You hold one share, stored encrypted locally
-3. **Para Share** - Para holds another share on their infrastructure
-4. **Signing** - Both shares collaborate to sign (neither can sign alone)
-
-This means:
-- No single point of failure
-- Keys are never assembled in one place
-- You maintain custody via your share
-
-### Pregenerated Wallets
-
-This MCP uses Para's "pregenerated wallet" flow - perfect for CLI:
-
-1. Provide email address
-2. Wallet is created instantly (no browser auth)
-3. User share is stored locally for signing
-4. Email owner can "claim" the wallet later at getpara.com
+---
 
 ## Security
 
-### Local Storage
-
-Session data is stored at `~/.claude/para-wallet/session.enc`:
-- Encrypted with AES-256-GCM
-- Key stored in `~/.claude/para-wallet/.key`
+**Local Storage**
+- Session encrypted with AES-256-GCM at `~/.claude/para-wallet/`
 - Session expires after 24 hours of inactivity
 
-### Transaction Safety
+**Transaction Safety**
+- All signing requires explicit approval
+- Full transaction details shown before signing
+- Amount, recipient, and gas estimates displayed
 
-All signing operations require explicit user approval:
-- Message signing shows the message content
-- Transaction signing shows decoded details
-- Send operations show amount, recipient, and estimated gas
+---
 
-## Development
+## Current Limitations
 
-### Build
+- **ERC-20 transfers** — Balance checks supported, transfers coming soon
+- **SPL tokens** — Not yet supported
+- **Complex DeFi** — Basic patterns supported, advanced interactions in development
 
-```bash
-npm install
-npm run build
-```
+---
 
-### Test
+## Credits
 
-```bash
-# Set your API key
-export PARA_API_KEY='your-key-here'
+- [Para](https://getpara.com) — MPC wallet infrastructure
+- [Claude Code](https://claude.ai/code) — AI coding assistant
+- [MCP](https://modelcontextprotocol.io/) — Model Context Protocol
 
-# Test MCP server
-./test-mcp.sh
-```
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `PARA_API_KEY` | Your Para API key | Required |
-| `PARA_ENV` | `beta` or `production` | `beta` |
-
-## Limitations
-
-- **Solana transactions** - Signing supported, but full tx building requires `@solana/web3.js`
-- **ERC-20 tokens** - Balance checks only (transfers need token ABI)
-- **SPL tokens** - Not yet supported (requires `@solana/spl-token`)
-- **Transaction decoding** - Basic support for common patterns
+---
 
 ## License
 
 MIT
-
-## Credits
-
-- [Para](https://getpara.com) - MPC wallet infrastructure
-- [Claude Code](https://claude.ai/claude-code) - AI coding assistant
-- [MCP SDK](https://modelcontextprotocol.io/) - Model Context Protocol
