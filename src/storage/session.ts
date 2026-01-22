@@ -21,11 +21,12 @@ export interface WalletSession {
   authenticated: boolean;
   address?: string;          // EVM address (works for all EVM chains)
   solanaAddress?: string;    // Solana address (Ed25519)
+  walletId?: string;         // Para wallet ID for EVM (used for REST API signing)
+  solanaWalletId?: string;   // Para wallet ID for Solana
   email?: string;            // Email if using email identifier (portable)
   identifierType?: 'email' | 'customId';  // Type of identifier used
   identifier?: string;       // The actual identifier value
-  paraSessionToken?: string;
-  paraUserShare?: string;    // MPC user share for signing (encrypted at rest)
+  paraSessionToken?: string; // Legacy: kept for backward compatibility
   pendingEmail?: string;     // Legacy: Email pending verification
   pendingIdentifier?: string;  // Identifier pending setup completion
   chains: string[];

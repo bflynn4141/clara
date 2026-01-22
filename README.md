@@ -1,6 +1,18 @@
-# Para Wallet MCP
+# Clara
 
-A Claude Code plugin that gives you a blockchain wallet powered by [Para](https://getpara.com). Create a wallet once, use it everywhere in Claude Code.
+**Keys should be as universal as code.**
+
+A wallet for Claude Code, powered by [Para](https://getpara.com).
+
+https://github.com/bflynn4141/para-wallet/raw/main/assets/clara-demo.mp4
+
+---
+
+Users are moving from app-specific frontends to their own AI-powered clients. You don't go to a website—your assistant goes for you. When users interact with blockchains through their own clients, keys need to travel with them.
+
+Clara is the first wallet built for this shift. Not a browser extension. Not an app. A capability that lives where the user already is.
+
+---
 
 ## Features
 

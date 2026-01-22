@@ -89,22 +89,23 @@
 
     /* Logo */
     .logo {
+      margin-bottom: 48px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .logo-icon {
+      width: 32px;
+      height: 40px;
+    }
+
+    .logo-text {
       font-size: 11px;
       font-weight: 400;
       letter-spacing: 0.25em;
       text-transform: uppercase;
       color: var(--gray);
-      margin-bottom: 48px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-
-    .logo::before {
-      content: "";
-      width: 6px;
-      height: 6px;
-      background: var(--white);
     }
 
     /* Hero - minimal */
@@ -167,22 +168,16 @@
     }
 
     .install pre {
-      font-size: 11px;
+      font-size: 14px;
       line-height: 1.7;
       overflow-x: auto;
       margin: 0;
     }
 
-    .install .dim {
-      color: #444;
-    }
-
-    .install .key {
-      color: var(--light-gray);
-    }
-
-    .install .str {
+    .install .command {
+      font-size: 16px;
       color: var(--white);
+      padding: 8px 0;
     }
 
     .install-note {
@@ -284,30 +279,33 @@
   <div class="pixel" style="bottom: 18%; right: 22%;"></div>
 
   <div class="container">
-    <div class="logo">Clara</div>
+    <div class="logo">
+      <!-- Pixel logo: stylized C -->
+      <svg class="logo-icon" viewBox="0 0 5 6" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="3" y="0" width="2" height="1" fill="#fff"/>
+        <rect x="1" y="1" width="1" height="1" fill="#888"/>
+        <rect x="2" y="1" width="1" height="1" fill="#888"/>
+        <rect x="3" y="1" width="1" height="1" fill="#666"/>
+        <rect x="1" y="2" width="1" height="1" fill="#888"/>
+        <rect x="1" y="3" width="1" height="1" fill="#888"/>
+        <rect x="1" y="4" width="1" height="1" fill="#888"/>
+        <rect x="2" y="4" width="1" height="1" fill="#888"/>
+        <rect x="3" y="4" width="1" height="1" fill="#666"/>
+      </svg>
+      <span class="logo-text">Clara</span>
+    </div>
 
     <section class="hero">
       <h1>Your wallet inside Claude&nbsp;Code.</h1>
-      <p class="tagline">MPC-secured. Zero friction.</p>
+      <p class="tagline">Keys as universal as code.</p>
     </section>
 
     <section class="install">
       <div class="install-header">
-        <span class="install-label">~/.claude.json</span>
+        <span class="install-label">Install</span>
         <button class="copy-btn" onclick="copyConfig()">Copy</button>
       </div>
-      <pre><span class="dim">{</span>
-  <span class="key">"mcpServers"</span><span class="dim">:</span> <span class="dim">{</span>
-    <span class="str">"clara"</span><span class="dim">:</span> <span class="dim">{</span>
-      <span class="key">"command"</span><span class="dim">:</span> <span class="str">"npx"</span><span class="dim">,</span>
-      <span class="key">"args"</span><span class="dim">:</span> <span class="dim">[</span><span class="str">"-y"</span><span class="dim">,</span> <span class="str">"clara-wallet"</span><span class="dim">]</span><span class="dim">,</span>
-      <span class="key">"env"</span><span class="dim">:</span> <span class="dim">{</span> <span class="key">"PARA_API_KEY"</span><span class="dim">:</span> <span class="str">"your-key"</span> <span class="dim">}</span>
-    <span class="dim">}</span>
-  <span class="dim">}</span>
-<span class="dim">}</span></pre>
-      <div class="install-note">
-        Get API key → <a href="https://developer.getpara.com" target="_blank">developer.getpara.com</a>
-      </div>
+      <pre class="command">npx clara-wallet</pre>
     </section>
 
     <div class="features">
@@ -324,16 +322,7 @@
 
   <script>
     function copyConfig() {
-      const config = `{
-  "mcpServers": {
-    "clara": {
-      "command": "npx",
-      "args": ["-y", "clara-wallet"],
-      "env": { "PARA_API_KEY": "your-key" }
-    }
-  }
-}`;
-      navigator.clipboard.writeText(config);
+      navigator.clipboard.writeText('npx clara-wallet');
       const btn = document.querySelector('.copy-btn');
       btn.textContent = 'Copied!';
       setTimeout(() => btn.textContent = 'Copy', 2000);

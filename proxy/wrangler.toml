@@ -1,0 +1,9 @@
+name = "clara-proxy"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Your Cloudflare account_id (run `wrangler whoami` to find it)
+# account_id = "your-account-id"
+
+# Deploy command: wrangler deploy
+# Add secret: wrangler secret put PARA_API_KEY
