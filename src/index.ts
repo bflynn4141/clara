@@ -15,6 +15,7 @@
  * - wallet_send: Send tokens (requires approval)
  * - wallet_logout: Clear local session
  * - wallet_resolve_ens: Resolve ENS names to addresses
+ * - wallet_portfolio: View portfolio across all chains
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -30,6 +31,7 @@ import { registerSignTransactionTool } from "./tools/sign-transaction.js";
 import { registerSendTool } from "./tools/send.js";
 import { registerLogoutTool } from "./tools/logout.js";
 import { registerResolveEnsTool } from "./tools/resolve-ens.js";
+import { registerPortfolioTool } from "./tools/portfolio.js";
 
 // Create MCP server instance
 const server = new McpServer({
@@ -47,6 +49,7 @@ registerSignTransactionTool(server);
 registerSendTool(server);
 registerLogoutTool(server);
 registerResolveEnsTool(server);
+registerPortfolioTool(server);
 
 // Start the server
 async function main() {

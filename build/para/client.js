@@ -665,5 +665,133 @@ export async function decodeTransaction(tx, _chain) {
         details: [`Contract: ${tx.to}`, `Method: ${selector}`],
     };
 }
+// CoinGecko API for price data (free, no API key required)
+const COINGECKO_API = "https://api.coingecko.com/api/v3";
+// Map chain native tokens to CoinGecko IDs
+const COINGECKO_IDS = {
+    ethereum: "ethereum",
+    base: "ethereum", // Base uses ETH
+    arbitrum: "ethereum", // Arbitrum uses ETH
+    optimism: "ethereum", // Optimism uses ETH
+    polygon: "matic-network",
+    solana: "solana",
+};
+/**
+ * Fetch current prices from CoinGecko
+ * Returns prices in USD for supported tokens
+ */
+export async function fetchPrices() {
+    const ids = [...new Set(Object.values(COINGECKO_IDS))].join(",");
+    try {
+        console.error("[clara] Fetching prices from CoinGecko...");
+        const response = await fetch(`${COINGECKO_API}/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true`, {
+            headers: {
+                "Accept": "application/json",
+            },
+        });
+        if (!response.ok) {
+            console.error(`[clara] CoinGecko error: ${response.status}`);
+            return {};
+        }
+        const data = await response.json();
+        console.error("[clara] Prices fetched:", Object.keys(data).join(", "));
+        return data;
+    }
+    catch (error) {
+        console.error("[clara] Price fetch error:", error);
+        return {};
+    }
+}
+/**
+ * Get portfolio across all chains
+ * Fetches balances and current prices, calculates USD values
+ */
+export async function getPortfolio() {
+    const session = await getSession();
+    if (!session?.authenticated || !session.address) {
+        throw new Error("Not authenticated");
+    }
+    console.error("[clara] Building portfolio...");
+    // Fetch prices first
+    const prices = await fetchPrices();
+    // Get balances for all chains in parallel
+    const evmChains = ["ethereum", "base", "arbitrum", "optimism", "polygon"];
+    const allChains = session.solanaAddress
+        ? [...evmChains, "solana"]
+        : evmChains;
+    const balancePromises = allChains.map(async (chain) => {
+        try {
+            const balances = await getBalances(chain);
+            const balance = balances[0]?.balance || "0";
+            const symbol = balances[0]?.symbol || (chain === "solana" ? "SOL" : chain === "polygon" ? "MATIC" : "ETH");
+            // Get price for this chain's native token
+            const coingeckoId = COINGECKO_IDS[chain];
+            const priceData = prices[coingeckoId];
+            const priceUsd = priceData?.usd || null;
+            const change24h = priceData?.usd_24h_change || null;
+            // Calculate USD value
+            const balanceNum = parseFloat(balance);
+            const valueUsd = priceUsd && balanceNum > 0 ? balanceNum * priceUsd : null;
+            return {
+                chain,
+                symbol,
+                balance,
+                priceUsd,
+                valueUsd,
+                change24h,
+            };
+        }
+        catch (error) {
+            console.error(`[clara] Failed to get balance for ${chain}:`, error);
+            return {
+                chain,
+                symbol: chain === "solana" ? "SOL" : chain === "polygon" ? "MATIC" : "ETH",
+                balance: "0",
+                priceUsd: null,
+                valueUsd: null,
+                change24h: null,
+            };
+        }
+    });
+    const items = await Promise.all(balancePromises);
+    // Calculate totals
+    const totalValueUsd = items.reduce((sum, item) => sum + (item.valueUsd || 0), 0);
+    // Calculate weighted average 24h change
+    let totalChange24h = null;
+    if (totalValueUsd > 0) {
+        const weightedChange = items.reduce((sum, item) => {
+            if (item.valueUsd && item.change24h !== null) {
+                return sum + (item.change24h * item.valueUsd);
+            }
+            return sum;
+        }, 0);
+        totalChange24h = weightedChange / totalValueUsd;
+    }
+    return {
+        items,
+        totalValueUsd,
+        totalChange24h,
+        lastUpdated: new Date().toISOString(),
+    };
+}
+/**
+ * Format USD value for display
+ */
+export function formatUsd(value) {
+    if (value === null || value === undefined)
+        return "—";
+    if (value < 0.01 && value > 0)
+        return "<$0.01";
+    return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+/**
+ * Format percentage change for display
+ */
+export function formatChange(change) {
+    if (change === null || change === undefined)
+        return "—";
+    const sign = change >= 0 ? "+" : "";
+    return `${sign}${change.toFixed(2)}%`;
+}
 export { CHAIN_CONFIG };
 //# sourceMappingURL=client.js.map

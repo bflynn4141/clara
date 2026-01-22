@@ -15,6 +15,7 @@
  * - wallet_send: Send tokens (requires approval)
  * - wallet_logout: Clear local session
  * - wallet_resolve_ens: Resolve ENS names to addresses
+ * - wallet_portfolio: View portfolio across all chains
  */
 export {};
 //# sourceMappingURL=index.d.ts.map

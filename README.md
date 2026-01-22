@@ -55,6 +55,12 @@ This breaks wallets. Browser extensions assume a browser. Hardware wallets assum
 "What's the ENS for 0xd8dA6B..."  → Reverse lookup
 ```
 
+**Portfolio View**
+```
+"What do I own?"                  → Shows all balances + USD values
+"Show my portfolio"               → Multi-chain overview with 24h changes
+```
+
 ---
 
 ## Quick Start
@@ -165,6 +171,7 @@ One wallet setup creates both an EVM address (works across all EVM chains) and a
 | `wallet_sign_transaction` | Sign transactions |
 | `wallet_send` | Send tokens (supports ENS names) |
 | `wallet_resolve_ens` | Resolve ENS names ↔ addresses |
+| `wallet_portfolio` | View portfolio with USD values |
 | `wallet_logout` | Clear local session |
 
 ---

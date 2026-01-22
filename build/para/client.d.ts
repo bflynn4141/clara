@@ -137,5 +137,46 @@ export declare function decodeTransaction(tx: TransactionRequest, _chain: Suppor
     action: string;
     details: string[];
 }>;
+/**
+ * Portfolio item representing a single asset
+ */
+export interface PortfolioItem {
+    chain: SupportedChain;
+    symbol: string;
+    balance: string;
+    priceUsd: number | null;
+    valueUsd: number | null;
+    change24h: number | null;
+}
+/**
+ * Full portfolio summary
+ */
+export interface Portfolio {
+    items: PortfolioItem[];
+    totalValueUsd: number;
+    totalChange24h: number | null;
+    lastUpdated: string;
+}
+/**
+ * Fetch current prices from CoinGecko
+ * Returns prices in USD for supported tokens
+ */
+export declare function fetchPrices(): Promise<Record<string, {
+    usd: number;
+    usd_24h_change: number;
+}>>;
+/**
+ * Get portfolio across all chains
+ * Fetches balances and current prices, calculates USD values
+ */
+export declare function getPortfolio(): Promise<Portfolio>;
+/**
+ * Format USD value for display
+ */
+export declare function formatUsd(value: number | null | undefined): string;
+/**
+ * Format percentage change for display
+ */
+export declare function formatChange(change: number | null | undefined): string;
 export { CHAIN_CONFIG };
 //# sourceMappingURL=client.d.ts.map
