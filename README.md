@@ -4,6 +4,8 @@
 
 A wallet for Claude Code, powered by [Para](https://getpara.com).
 
+🌐 **[tryclara.vercel.app](https://tryclara.vercel.app)**
+
 <video src="https://github.com/bflynn4141/para-wallet/raw/main/assets/clara-demo.mp4" width="100%" autoplay loop muted playsinline></video>
 
 ---
