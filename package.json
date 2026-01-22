@@ -1,6 +1,6 @@
 {
   "name": "clara-wallet",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Your wallet inside Claude Code - powered by Para MPC",
   "type": "module",
   "main": "build/index.js",
@@ -20,13 +20,19 @@
   "keywords": [
     "mcp",
     "claude-code",
+    "claude",
+    "anthropic",
     "wallet",
     "para",
     "clara",
     "web3",
     "ethereum",
     "solana",
-    "mpc"
+    "mpc",
+    "ens",
+    "crypto",
+    "blockchain",
+    "ai-agent"
   ],
   "author": "Brian Flynn",
   "license": "MIT",
