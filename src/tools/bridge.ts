@@ -25,6 +25,65 @@ import {
 
 const SUPPORTED_CHAINS = ["ethereum", "base", "arbitrum", "optimism", "polygon"] as const;
 
+// Native tokens by chain
+const NATIVE_TOKENS: Record<string, string> = {
+  ethereum: "ETH",
+  base: "ETH",
+  arbitrum: "ETH",
+  optimism: "ETH",
+  polygon: "MATIC",
+};
+
+// Minimum recommended gas in USD
+const MIN_GAS_USD = 2.0;
+
+/**
+ * Check if user has sufficient native token on destination chain for gas
+ * Returns warning message if they don't have enough
+ */
+async function checkDestinationGas(
+  toChain: SupportedChain,
+  address: string,
+  bridgingNativeToken: boolean
+): Promise<{ hasGas: boolean; balance: string; warning?: string }> {
+  try {
+    const balances = await getBalances(toChain);
+    const nativeBalance = parseFloat(balances[0]?.balance || "0");
+    const nativeUsd = parseFloat(balances[0]?.usdValue || "0");
+    const nativeSymbol = NATIVE_TOKENS[toChain] || "ETH";
+
+    // If bridging native token, they'll have gas after the bridge
+    if (bridgingNativeToken) {
+      return { hasGas: true, balance: balances[0]?.balance || "0" };
+    }
+
+    // Check if they have enough for gas
+    if (nativeUsd < MIN_GAS_USD && nativeBalance < 0.001) {
+      return {
+        hasGas: false,
+        balance: balances[0]?.balance || "0",
+        warning: [
+          `⚠️ **No gas on ${capitalizeFirst(toChain)}**`,
+          "",
+          `You have ${nativeBalance.toFixed(6)} ${nativeSymbol} on ${capitalizeFirst(toChain)}.`,
+          `After bridging, you won't be able to do anything without ${nativeSymbol} for gas.`,
+          "",
+          `**Recommended:** Bridge some ${nativeSymbol} first:`,
+          `  wallet_bridge fromToken="${nativeSymbol}" toToken="${nativeSymbol}" amount="0.01" fromChain="..." toChain="${toChain}"`,
+          "",
+          `Or continue anyway if you plan to bridge ${nativeSymbol} separately.`,
+        ].join("\n"),
+      };
+    }
+
+    return { hasGas: true, balance: balances[0]?.balance || "0" };
+  } catch (error) {
+    // If we can't check, don't block the user
+    console.error("Failed to check destination gas:", error);
+    return { hasGas: true, balance: "unknown" };
+  }
+}
+
 export function registerBridgeTool(server: McpServer) {
   server.registerTool(
     "wallet_bridge",
@@ -102,6 +161,16 @@ Supported tokens: ETH, USDC, USDT, DAI, WETH, WBTC (or any contract address)`,
           };
         }
 
+        // Check if user has gas on destination chain (critical for non-native token bridges)
+        const nativeSymbols = ["ETH", "MATIC", "NATIVE"];
+        const bridgingNativeToken = nativeSymbols.includes(fromToken.toUpperCase()) &&
+                                    nativeSymbols.includes(toToken.toUpperCase());
+        const destGasCheck = await checkDestinationGas(
+          toChain as SupportedChain,
+          session.address,
+          bridgingNativeToken
+        );
+
         // Get bridge quote
         const quote = await getBridgeQuote(
           fromToken,
@@ -116,16 +185,33 @@ Supported tokens: ETH, USDC, USDT, DAI, WETH, WBTC (or any contract address)`,
         const quoteDisplay = formatBridgeQuote(quote);
 
         if (action === "quote") {
+          // Include gas warning in quote if applicable
+          let response = quoteDisplay;
+          if (destGasCheck.warning) {
+            response += "\n\n" + destGasCheck.warning;
+          }
+          response += "\n\n" + `To execute this bridge, run again with action="execute"`;
+
           return {
             content: [{
               type: "text" as const,
-              text: quoteDisplay + "\n\n" +
-                `To execute this bridge, run again with action="execute"`
+              text: response
             }]
           };
         }
 
-        // Execute the bridge
+        // Execute the bridge - but first check for gas on destination
+        if (!destGasCheck.hasGas && destGasCheck.warning) {
+          // Block execution if no gas on destination for non-native token bridges
+          return {
+            content: [{
+              type: "text" as const,
+              text: quoteDisplay + "\n\n" + destGasCheck.warning + "\n\n" +
+                `❌ Bridge blocked: You need ${NATIVE_TOKENS[toChain] || "ETH"} on ${capitalizeFirst(toChain)} first.`
+            }]
+          };
+        }
+
         if (quote.needsApproval) {
           return await handleApproval(quote);
         }

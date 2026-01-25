@@ -1710,6 +1710,88 @@ export async function sendTransaction(
 }
 
 /**
+ * Transaction receipt from eth_getTransactionReceipt
+ */
+export interface TransactionReceipt {
+  status: "success" | "reverted" | "pending";
+  blockNumber?: string;
+  gasUsed?: string;
+  effectiveGasPrice?: string;
+}
+
+/**
+ * Wait for a transaction to be confirmed
+ *
+ * @param txHash - Transaction hash to wait for
+ * @param chain - Chain the transaction was sent on
+ * @param options - Polling options
+ * @returns Transaction receipt
+ */
+export async function waitForTransaction(
+  txHash: string,
+  chain: SupportedChain,
+  options: {
+    pollIntervalMs?: number;
+    timeoutMs?: number;
+    confirmations?: number;
+  } = {}
+): Promise<TransactionReceipt> {
+  if (chain === "solana") {
+    // Solana not supported for now
+    return { status: "success" };
+  }
+
+  const pollInterval = options.pollIntervalMs || 3000; // 3 seconds
+  const timeout = options.timeoutMs || 2 * 60 * 1000; // 2 minutes
+  const startTime = Date.now();
+  const config = CHAIN_CONFIG[chain];
+
+  while (Date.now() - startTime < timeout) {
+    try {
+      const response = await fetch(config.rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "eth_getTransactionReceipt",
+          params: [txHash],
+          id: 1,
+        }),
+      });
+
+      const result = await response.json() as {
+        result?: {
+          status: string;
+          blockNumber: string;
+          gasUsed: string;
+          effectiveGasPrice: string;
+        };
+        error?: { message: string };
+      };
+
+      if (result.result) {
+        // Transaction mined
+        const receipt = result.result;
+        return {
+          status: receipt.status === "0x1" ? "success" : "reverted",
+          blockNumber: receipt.blockNumber,
+          gasUsed: receipt.gasUsed,
+          effectiveGasPrice: receipt.effectiveGasPrice,
+        };
+      }
+
+      // Not yet mined, continue polling
+    } catch (error) {
+      console.error("[clara] Receipt poll error:", error);
+    }
+
+    await new Promise(resolve => setTimeout(resolve, pollInterval));
+  }
+
+  return { status: "pending" };
+}
+
+/**
  * Estimate gas for a transaction
  */
 export async function estimateGas(
@@ -4039,6 +4121,121 @@ export async function executeBridge(
     status: "pending",
     estimatedArrival,
   };
+}
+
+/**
+ * Bridge status from Li.Fi status API
+ */
+export interface BridgeStatus {
+  status: "PENDING" | "DONE" | "FAILED" | "NOT_FOUND";
+  substatus?: string;
+  sending?: {
+    txHash: string;
+    chainId: number;
+    amount: string;
+    token: { symbol: string };
+  };
+  receiving?: {
+    txHash?: string;
+    chainId: number;
+    amount?: string;
+    token?: { symbol: string };
+  };
+  tool?: string;
+}
+
+/**
+ * Get the status of a bridge transaction
+ * Uses Li.Fi's status endpoint to track cross-chain transfers
+ *
+ * @param txHash - Source chain transaction hash
+ * @param fromChain - Source chain
+ * @param toChain - Destination chain
+ * @returns Bridge status object
+ */
+export async function getBridgeStatus(
+  txHash: string,
+  fromChain: SupportedChain,
+  toChain: SupportedChain
+): Promise<BridgeStatus> {
+  const fromConfig = CHAIN_CONFIG[fromChain];
+  const toConfig = CHAIN_CONFIG[toChain];
+
+  if (!fromConfig?.chainId || !toConfig?.chainId) {
+    throw new Error(`Unsupported chain: ${fromChain} or ${toChain}`);
+  }
+
+  const params = new URLSearchParams({
+    txHash,
+    fromChain: fromConfig.chainId.toString(),
+    toChain: toConfig.chainId.toString(),
+  });
+
+  const response = await fetch(`${LIFI_API}/status?${params}`);
+
+  if (!response.ok) {
+    if (response.status === 404) {
+      return { status: "NOT_FOUND" };
+    }
+    throw new Error(`Failed to get bridge status: ${response.status}`);
+  }
+
+  const data = await response.json() as {
+    status: string;
+    substatus?: string;
+    sending?: { txHash: string; chainId: number; amount: string; token: { symbol: string } };
+    receiving?: { txHash?: string; chainId: number; amount?: string; token?: { symbol: string } };
+    tool?: string;
+  };
+
+  return {
+    status: data.status as BridgeStatus["status"],
+    substatus: data.substatus,
+    sending: data.sending,
+    receiving: data.receiving,
+    tool: data.tool,
+  };
+}
+
+/**
+ * Wait for a bridge to complete with polling
+ * Returns when the bridge is complete or timeout is reached
+ *
+ * @param txHash - Source chain transaction hash
+ * @param fromChain - Source chain
+ * @param toChain - Destination chain
+ * @param options - Polling options
+ * @returns Final bridge status
+ */
+export async function waitForBridge(
+  txHash: string,
+  fromChain: SupportedChain,
+  toChain: SupportedChain,
+  options: {
+    pollIntervalMs?: number;
+    timeoutMs?: number;
+    onUpdate?: (status: BridgeStatus) => void;
+  } = {}
+): Promise<BridgeStatus> {
+  const pollInterval = options.pollIntervalMs || 15000; // 15 seconds
+  const timeout = options.timeoutMs || 10 * 60 * 1000; // 10 minutes
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeout) {
+    const status = await getBridgeStatus(txHash, fromChain, toChain);
+
+    if (options.onUpdate) {
+      options.onUpdate(status);
+    }
+
+    if (status.status === "DONE" || status.status === "FAILED") {
+      return status;
+    }
+
+    await new Promise(resolve => setTimeout(resolve, pollInterval));
+  }
+
+  return { status: "PENDING", substatus: "TIMEOUT" };
 }
 
 /**

@@ -30,14 +30,18 @@ import {
   encodeApproveCalldata,
   resolveToken,
   sendTransaction,
+  waitForTransaction,
   checkGasForTransaction,
   executeSwap,
   getBridgeQuote,
   executeBridge,
+  getBridgeStatus,
+  waitForBridge,
   type SupportedChain,
   type YieldOpportunity,
   type YieldPlan,
   type BridgeQuote,
+  type BridgeStatus,
 } from "../para/client.js";
 
 const SUPPORTED_CHAINS = ["base", "arbitrum"] as const; // MVP chains
@@ -151,10 +155,11 @@ Supported: USDC, USDT, DAI on Base and Arbitrum (Aave v3, Compound v3)`,
         action: z.enum(["plan", "deposit", "withdraw", "positions", "history"]).optional().default("plan").describe("plan = show opportunity, deposit = execute deposit, withdraw = execute withdrawal, positions = show current deposits, history = show transaction history"),
         chain: z.enum(SUPPORTED_CHAINS).optional().describe("Specific chain (required for withdraw)"),
         autoBridge: z.boolean().optional().default(true).describe("Automatically bridge tokens if they're on a different chain than the best yield (default: true)"),
+        waitForBridge: z.boolean().optional().default(false).describe("Wait for bridge completion before returning (polls status, up to 10 min)"),
       },
     },
     async (args) => {
-      const { asset, amount, action = "plan", chain, autoBridge = true } = args;
+      const { asset, amount, action = "plan", chain, autoBridge = true, waitForBridge: shouldWaitForBridge = false } = args;
 
       try {
         const session = await getSession();
@@ -307,11 +312,16 @@ Supported: USDC, USDT, DAI on Base and Arbitrum (Aave v3, Compound v3)`,
         // Execute the deposit (with bridge if needed)
         const outputLines: string[] = [planDisplay, ""];
 
+        // Determine total steps for progress indicator
+        const steps = getDepositSteps(
+          needsBridge,
+          needsBridge && bridgeQuote?.needsApproval || false,
+          plan.needsApproval
+        );
+        let currentStep = 0;
+
         // Execute bridge first if needed
         if (needsBridge && bridgeQuote && bridgeFromChain && bridgeToChain) {
-          outputLines.push(`🌉 Step 1: Bridging ${amount} ${asset.toUpperCase()} from ${capitalizeFirst(bridgeFromChain)} → ${capitalizeFirst(bridgeToChain)}...`);
-          outputLines.push("");
-
           try {
             // Check gas on source chain for bridge
             const bridgeGasResult = await ensureGasForOperation(bridgeFromChain, "deposit"); // Bridge uses similar gas
@@ -324,7 +334,10 @@ Supported: USDC, USDT, DAI on Base and Arbitrum (Aave v3, Compound v3)`,
 
             // Handle bridge approval if needed
             if (bridgeQuote.needsApproval && bridgeQuote.approvalAddress) {
-              outputLines.push(`🔐 Bridge approval required...`);
+              outputLines.push(formatStepProgress({ steps, currentStep }));
+              outputLines.push("");
+              outputLines.push(`🔐 Sending bridge approval transaction...`);
+
               const resolved = resolveToken(asset, bridgeFromChain);
               if (resolved) {
                 const decimals = asset.toUpperCase() === "USDC" || asset.toUpperCase() === "USDT" ? 6 : 18;
@@ -337,36 +350,141 @@ Supported: USDC, USDT, DAI on Base and Arbitrum (Aave v3, Compound v3)`,
                   approvalData
                 );
                 outputLines.push(`✅ Bridge approval submitted: ${approvalResult.txHash}`);
-                outputLines.push(`⏳ Please wait for approval confirmation, then run the command again.`);
+                outputLines.push("");
+                outputLines.push(`⏳ Wait for confirmation, then run the command again to continue.`);
                 return { content: [{ type: "text" as const, text: outputLines.join("\n") }] };
               }
             }
+
+            // Move to bridge step
+            currentStep = bridgeQuote.needsApproval ? 1 : 0;
+            outputLines.push(formatStepProgress({ steps, currentStep }));
+            outputLines.push("");
+            outputLines.push(`🌉 Bridging ${amount} ${asset.toUpperCase()} from ${capitalizeFirst(bridgeFromChain)} → ${capitalizeFirst(bridgeToChain)}...`);
 
             // Execute bridge
             const bridgeResult = await executeBridge(bridgeQuote);
             outputLines.push(`✅ Bridge initiated: ${bridgeResult.txHash}`);
             outputLines.push(`⏳ Estimated arrival: ${bridgeResult.estimatedArrival}`);
             outputLines.push("");
-            outputLines.push(`⚠️ Bridge in progress. Once your ${asset.toUpperCase()} arrives on ${capitalizeFirst(bridgeToChain)}, run this command again to complete the deposit.`);
-            outputLines.push("");
-            outputLines.push(`Check bridge status, then: wallet_earn asset="${asset}" amount="${amount}" action="deposit" chain="${bridgeToChain}"`);
 
-            return { content: [{ type: "text" as const, text: outputLines.join("\n") }] };
+            // Optionally wait for bridge completion
+            if (shouldWaitForBridge) {
+              outputLines.push(`🔄 Waiting for bridge to complete (polling every 15s, up to 10 min)...`);
+              outputLines.push("");
+
+              try {
+                const finalStatus = await waitForBridge(
+                  bridgeResult.txHash,
+                  bridgeFromChain,
+                  bridgeToChain,
+                  {
+                    pollIntervalMs: 15000,
+                    timeoutMs: 10 * 60 * 1000,
+                    onUpdate: (status) => {
+                      console.error(`[clara] Bridge status: ${status.status} (${status.substatus || ""})`);
+                    },
+                  }
+                );
+
+                if (finalStatus.status === "DONE") {
+                  outputLines.push(`✅ Bridge complete!`);
+                  if (finalStatus.receiving?.txHash) {
+                    outputLines.push(`   Destination tx: ${finalStatus.receiving.txHash}`);
+                  }
+                  outputLines.push("");
+                  outputLines.push(`Your ${asset.toUpperCase()} has arrived on ${capitalizeFirst(bridgeToChain)}. Proceeding to deposit...`);
+                  outputLines.push("");
+                  // Continue to deposit step below (don't return)
+                } else if (finalStatus.status === "FAILED") {
+                  outputLines.push(`❌ Bridge failed: ${finalStatus.substatus || "Unknown error"}`);
+                  return { content: [{ type: "text" as const, text: outputLines.join("\n") }] };
+                } else {
+                  outputLines.push(`⏱️ Bridge still pending after 10 minutes.`);
+                  outputLines.push(`Check status manually, then run:`);
+                  outputLines.push(`wallet_earn asset="${asset}" amount="${amount}" action="deposit" chain="${bridgeToChain}"`);
+                  return { content: [{ type: "text" as const, text: outputLines.join("\n") }] };
+                }
+              } catch (pollError) {
+                console.error("[clara] Bridge polling error:", pollError);
+                outputLines.push(`⚠️ Unable to poll bridge status. Check manually, then run:`);
+                outputLines.push(`wallet_earn asset="${asset}" amount="${amount}" action="deposit" chain="${bridgeToChain}"`);
+                return { content: [{ type: "text" as const, text: outputLines.join("\n") }] };
+              }
+            } else {
+              outputLines.push(`⚠️ Bridge in progress. Once your ${asset.toUpperCase()} arrives on ${capitalizeFirst(bridgeToChain)}, run this command again to complete the deposit.`);
+              outputLines.push("");
+              outputLines.push(`Tip: Add waitForBridge=true to auto-wait for completion.`);
+              outputLines.push(`Next: wallet_earn asset="${asset}" amount="${amount}" action="deposit" chain="${bridgeToChain}"`);
+
+              return { content: [{ type: "text" as const, text: outputLines.join("\n") }] };
+            }
           } catch (error) {
             return { content: [{ type: "text" as const, text: `❌ Bridge failed: ${error instanceof Error ? error.message : "Unknown error"}` }] };
           }
         }
 
         if (plan.needsApproval) {
-          const gasResult = await ensureGasForOperation(plan.chain, "approve");
-          if (!gasResult.ready) {
-            return { content: [{ type: "text" as const, text: planDisplay + "\n\n" + (gasResult.message || "Insufficient gas for approval") }] };
+          // Update step for deposit approval
+          currentStep = needsBridge ? (bridgeQuote?.needsApproval ? 2 : 1) : 0;
+          outputLines.push(formatStepProgress({ steps, currentStep }));
+          outputLines.push("");
+
+          const approvalGasResult = await ensureGasForOperation(plan.chain, "approve");
+          if (!approvalGasResult.ready) {
+            return { content: [{ type: "text" as const, text: planDisplay + "\n\n" + (approvalGasResult.message || "Insufficient gas for approval") }] };
           }
-          if (gasResult.swapExecuted && gasResult.message) {
-            outputLines.push(gasResult.message, "");
+          if (approvalGasResult.swapExecuted && approvalGasResult.message) {
+            outputLines.push(approvalGasResult.message, "");
           }
-          return await handleApproval(plan, outputLines);
+
+          // Send approval transaction
+          outputLines.push(`🔐 Approving ${plan.asset} for ${plan.protocol}...`);
+
+          if (!plan.approvalAddress) {
+            return { content: [{ type: "text" as const, text: `❌ Approval address not available.` }] };
+          }
+
+          const decimals = plan.asset === "USDC" || plan.asset === "USDT" ? 6 : 18;
+          const approvalData = encodeApproveCalldata(plan.approvalAddress, plan.amount, decimals);
+
+          const approvalResult = await sendTransaction(
+            plan.assetAddress,
+            "0",
+            plan.chain,
+            undefined,
+            approvalData
+          );
+
+          outputLines.push(`✅ Approval submitted: ${approvalResult.txHash}`);
+          outputLines.push(`⏳ Waiting for confirmation...`);
+          outputLines.push("");
+
+          // Wait for approval to confirm, then auto-continue
+          const approvalReceipt = await waitForTransaction(
+            approvalResult.txHash,
+            plan.chain,
+            { pollIntervalMs: 3000, timeoutMs: 60000 }
+          );
+
+          if (approvalReceipt.status === "reverted") {
+            outputLines.push(`❌ Approval transaction reverted.`);
+            return { content: [{ type: "text" as const, text: outputLines.join("\n") }] };
+          }
+
+          if (approvalReceipt.status === "pending") {
+            outputLines.push(`⏱️ Approval still pending after 60s. Run the command again to check and continue.`);
+            return { content: [{ type: "text" as const, text: outputLines.join("\n") }] };
+          }
+
+          outputLines.push(`✅ Approval confirmed! Proceeding to deposit...`);
+          outputLines.push("");
         }
+
+        // Final step: deposit
+        currentStep = steps.length - 1;
+        outputLines.push(formatStepProgress({ steps, currentStep }));
+        outputLines.push("");
 
         const gasResult = await ensureGasForOperation(plan.chain, "deposit");
         if (!gasResult.ready) {
@@ -376,10 +494,12 @@ Supported: USDC, USDT, DAI on Base and Arbitrum (Aave v3, Compound v3)`,
           outputLines.push(gasResult.message, "");
         }
 
+        outputLines.push(`💰 Depositing ${plan.amount} ${plan.asset} into ${plan.protocol}...`);
         const result = await executeYieldDeposit(plan);
 
+        outputLines.push("");
         outputLines.push(
-          `✅ Deposit submitted!`,
+          `✅ Deposit complete!`,
           "",
           `Transaction: ${result.txHash}`,
           `Status: ${result.status}`,
@@ -398,7 +518,8 @@ Supported: USDC, USDT, DAI on Base and Arbitrum (Aave v3, Compound v3)`,
 }
 
 /**
- * Show available yield opportunities
+ * Show available yield opportunities with cross-chain awareness
+ * Highlights when bridging to a different chain could earn significantly more yield
  */
 async function showYieldOpportunities(
   asset: string,
@@ -417,13 +538,22 @@ async function showYieldOpportunities(
 
   const session = await getSession();
   const balanceByChain: Record<string, number> = {};
+  let totalBalance = 0;
+  let chainWithBalance: SupportedChain | undefined;
 
   if (session?.address) {
     await Promise.all(
       chains.map(async (chain) => {
         try {
           const balance = await getTokenBalance(asset, chain, session.address!);
-          balanceByChain[chain] = parseFloat(balance.balance);
+          const bal = parseFloat(balance.balance);
+          balanceByChain[chain] = bal;
+          if (bal > 0) {
+            totalBalance += bal;
+            if (!chainWithBalance || bal > balanceByChain[chainWithBalance]) {
+              chainWithBalance = chain;
+            }
+          }
         } catch {
           balanceByChain[chain] = 0;
         }
@@ -431,33 +561,75 @@ async function showYieldOpportunities(
     );
   }
 
-  // Sort by APY
+  // Sort by APY (descending)
   opportunities.sort((a, b) => b.apyTotal - a.apyTotal);
   const best = opportunities[0];
+
+  // Check if user has funds on a different chain than the best yield
+  const fundsOnBestChain = chainWithBalance === best.chain;
+  const localRate = chainWithBalance
+    ? opportunities.find(o => o.chain === chainWithBalance)?.apyTotal || 0
+    : 0;
+  const apyDifference = best.apyTotal - localRate;
 
   const lines: string[] = [
     `📊 Yield Opportunities for ${asset.toUpperCase()}`,
     "",
-    `┌─────────────────────────────────────────────────────────────┐`,
-    `│  💡 RECOMMENDATION                                          │`,
-    `│                                                             │`,
-    `│  ${capitalizeFirst(best.chain)} offers the best rate: ${best.apyTotal.toFixed(2)}% APY`.padEnd(62) + `│`,
-    `└─────────────────────────────────────────────────────────────┘`,
-    "",
-    `All options (sorted by APY):`,
-    "",
   ];
+
+  // Show user's current position
+  if (totalBalance > 0) {
+    lines.push(`💰 Your ${asset.toUpperCase()}: ${totalBalance.toFixed(2)} on ${capitalizeFirst(chainWithBalance!)}`);
+    lines.push("");
+  }
+
+  // Prominent recommendation box
+  lines.push(`┌─────────────────────────────────────────────────────────────┐`);
+
+  if (!fundsOnBestChain && apyDifference >= 0.5 && totalBalance > 0) {
+    // Cross-chain opportunity worth highlighting
+    const annualExtra = (totalBalance * apyDifference) / 100;
+    const monthlyExtra = annualExtra / 12;
+
+    lines.push(`│  🚀 CROSS-CHAIN OPPORTUNITY                                 │`);
+    lines.push(`│                                                             │`);
+    lines.push(`│  Best yield: ${best.apyTotal.toFixed(2)}% on ${capitalizeFirst(best.chain)} (${best.protocol})`.padEnd(62) + `│`);
+    lines.push(`│  Your chain: ${localRate.toFixed(2)}% on ${capitalizeFirst(chainWithBalance!)}`.padEnd(62) + `│`);
+    lines.push(`│                                                             │`);
+    lines.push(`│  📈 Extra yield: +${apyDifference.toFixed(2)}% APY`.padEnd(62) + `│`);
+    lines.push(`│  💵 Extra earnings: ~$${monthlyExtra.toFixed(2)}/month (+$${annualExtra.toFixed(2)}/year)`.padEnd(62) + `│`);
+    lines.push(`│                                                             │`);
+    lines.push(`│  Bridge + deposit will be automatic with:                   │`);
+    lines.push(`│  asset="${asset}", amount="${totalBalance.toFixed(0)}", action="deposit"`.padEnd(62) + `│`);
+  } else {
+    // Simple recommendation
+    lines.push(`│  💡 BEST RATE: ${best.apyTotal.toFixed(2)}% APY`.padEnd(62) + `│`);
+    lines.push(`│  ${best.protocol} on ${capitalizeFirst(best.chain)}`.padEnd(62) + `│`);
+    if (fundsOnBestChain && totalBalance > 0) {
+      lines.push(`│  ✓ Your funds are already on the best chain!`.padEnd(62) + `│`);
+    }
+  }
+  lines.push(`└─────────────────────────────────────────────────────────────┘`);
+  lines.push("");
+
+  // All options
+  lines.push(`All options (sorted by APY):`);
+  lines.push("");
 
   for (let i = 0; i < Math.min(opportunities.length, 5); i++) {
     const opp = opportunities[i];
     const rank = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}.`;
     const balance = balanceByChain[opp.chain] || 0;
-    const balanceTag = balance > 0 ? ` [${balance.toFixed(2)} available]` : "";
-    lines.push(`${rank} ${opp.protocol} on ${capitalizeFirst(opp.chain)}: ${opp.apyTotal.toFixed(2)}% APY${balanceTag}`);
+    const balanceTag = balance > 0 ? ` [${balance.toFixed(2)} here]` : "";
+    const apyStr = opp.apyTotal.toFixed(2).padStart(5);
+    lines.push(`${rank} ${apyStr}% ${opp.protocol} on ${capitalizeFirst(opp.chain)}${balanceTag}`);
   }
 
   lines.push("");
-  lines.push(`To deposit, specify an amount: asset="${asset}", amount="100"`);
+  lines.push(`To deposit: asset="${asset}", amount="100", action="deposit"`);
+  if (!fundsOnBestChain && totalBalance > 0) {
+    lines.push(`  → Clara will bridge to the best chain automatically!`);
+  }
 
   return { content: [{ type: "text" as const, text: lines.join("\n") }] };
 }
@@ -536,11 +708,96 @@ async function checkAssetBalance(
   return { sufficient: false, balance: "0", chainsChecked, balancesByChain };
 }
 
+// Break-even threshold in months - if fees take more than this to recover, warn user
+const BREAKEVEN_WARNING_MONTHS = 3;
+
+/**
+ * Multi-step progress indicator
+ * Shows visual progress through multi-transaction flows
+ */
+interface StepProgress {
+  steps: string[];
+  currentStep: number;
+}
+
+function formatStepProgress(progress: StepProgress): string {
+  const { steps, currentStep } = progress;
+  const parts: string[] = [];
+
+  for (let i = 0; i < steps.length; i++) {
+    if (i < currentStep) {
+      // Completed step
+      parts.push(`✅ ${steps[i]}`);
+    } else if (i === currentStep) {
+      // Current step
+      parts.push(`⏳ ${steps[i]} ← current`);
+    } else {
+      // Future step
+      parts.push(`⬜ ${steps[i]}`);
+    }
+  }
+
+  return [
+    `📋 Progress (${currentStep + 1}/${steps.length}):`,
+    ...parts.map(p => `   ${p}`),
+  ].join("\n");
+}
+
+/**
+ * Determine steps needed for a yield deposit
+ */
+function getDepositSteps(
+  needsBridge: boolean,
+  bridgeNeedsApproval: boolean,
+  depositNeedsApproval: boolean
+): string[] {
+  const steps: string[] = [];
+
+  if (needsBridge) {
+    if (bridgeNeedsApproval) {
+      steps.push("Approve bridge");
+    }
+    steps.push("Bridge tokens");
+  }
+
+  if (depositNeedsApproval) {
+    steps.push("Approve deposit");
+  }
+  steps.push("Deposit into protocol");
+
+  return steps;
+}
+
+/**
+ * Calculate break-even period and recommended minimum deposit
+ */
+function calculateFeeBreakeven(
+  depositAmount: number,
+  apy: number,
+  totalFeesUsd: number
+): { breakevenMonths: number; recommendedMinimum: number; showWarning: boolean } {
+  const monthlyYieldRate = apy / 100 / 12;
+  const monthlyYield = depositAmount * monthlyYieldRate;
+
+  const breakevenMonths = monthlyYield > 0 ? totalFeesUsd / monthlyYield : Infinity;
+
+  // Recommended minimum: deposit where fees = 1 month of yield (reasonable entry cost)
+  const recommendedMinimum = totalFeesUsd / monthlyYieldRate;
+
+  return {
+    breakevenMonths,
+    recommendedMinimum: Math.ceil(recommendedMinimum / 10) * 10, // Round up to nearest $10
+    showWarning: breakevenMonths > BREAKEVEN_WARNING_MONTHS,
+  };
+}
+
 /**
  * Format a yield plan for display
  */
 function formatPlan(plan: YieldPlan): string {
   const tvlStr = (plan.tvlUsd / 1_000_000).toFixed(1);
+  const depositAmount = parseFloat(plan.amount);
+  const totalFees = parseFloat(plan.estimatedGasUsd) * (plan.needsApproval ? 2 : 1); // Rough estimate
 
   const lines: string[] = [
     `💰 Yield Deposit Plan`,
@@ -557,9 +814,18 @@ function formatPlan(plan: YieldPlan): string {
     lines.push(`🔐 Approval required: You need to approve ${plan.asset} for ${plan.protocol} first.`);
   }
 
-  const annualEarnings = parseFloat(plan.amount) * (plan.apy / 100);
+  const annualEarnings = depositAmount * (plan.apy / 100);
   lines.push("");
   lines.push(`📈 Estimated annual earnings: ~${annualEarnings.toFixed(2)} ${plan.asset}`);
+
+  // Check if deposit is economically sensible
+  const feeAnalysis = calculateFeeBreakeven(depositAmount, plan.apy, totalFees);
+  if (feeAnalysis.showWarning) {
+    lines.push("");
+    lines.push(`⚠️ **Small deposit warning:**`);
+    lines.push(`   Gas fees (~$${totalFees.toFixed(2)}) take ~${feeAnalysis.breakevenMonths.toFixed(1)} months to recover.`);
+    lines.push(`   💡 Recommended minimum: $${feeAnalysis.recommendedMinimum} for this APY`);
+  }
 
   return lines.join("\n");
 }
@@ -578,6 +844,10 @@ function formatPlanWithBridge(
   }
 
   const tvlStr = (plan.tvlUsd / 1_000_000).toFixed(1);
+  const depositAmount = parseFloat(plan.amount);
+  const bridgeFees = parseFloat(bridgeQuote.estimatedGasUsd);
+  const depositFees = parseFloat(plan.estimatedGasUsd) * (plan.needsApproval ? 2 : 1);
+  const totalFees = bridgeFees + depositFees;
 
   const lines: string[] = [
     `🌉 Bridge + Deposit Plan`,
@@ -598,12 +868,20 @@ function formatPlanWithBridge(
     `└─────────────────────────────────────────────────────────────┘`,
   ];
 
-  const annualEarnings = parseFloat(plan.amount) * (plan.apy / 100);
+  const annualEarnings = depositAmount * (plan.apy / 100);
   lines.push("");
   lines.push(`📈 Estimated annual earnings: ~${annualEarnings.toFixed(2)} ${plan.asset}`);
+  lines.push(`💸 Total estimated cost: ~$${totalFees.toFixed(2)}`);
 
-  const totalGas = parseFloat(bridgeQuote.estimatedGasUsd) + parseFloat(plan.estimatedGasUsd);
-  lines.push(`💸 Total estimated cost: ~$${totalGas.toFixed(2)}`);
+  // Check if deposit is economically sensible given bridge + deposit costs
+  const feeAnalysis = calculateFeeBreakeven(depositAmount, plan.apy, totalFees);
+  if (feeAnalysis.showWarning) {
+    lines.push("");
+    lines.push(`⚠️ **Small deposit warning:**`);
+    lines.push(`   Total fees (~$${totalFees.toFixed(2)}) take ~${feeAnalysis.breakevenMonths.toFixed(1)} months to recover.`);
+    lines.push(`   💡 Recommended minimum for bridge + deposit: $${feeAnalysis.recommendedMinimum}`);
+    lines.push(`   Consider staying on ${capitalizeFirst(fromChain)} if deposit is small.`);
+  }
 
   return lines.join("\n");
 }
