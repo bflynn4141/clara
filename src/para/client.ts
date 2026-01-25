@@ -4328,6 +4328,48 @@ export function getSwappableTokens(chain: SupportedChain): Array<{ symbol: strin
 // DeFiLlama Yields API (free, no API key)
 const DEFILLAMA_YIELDS_API = "https://yields.llama.fi";
 
+// Cache for DeFiLlama pools data (avoids refetching large dataset)
+interface DefiLlamaPoolsCache {
+  data: Array<{
+    pool: string;
+    chain: string;
+    project: string;
+    symbol: string;
+    tvlUsd: number;
+    apy: number;
+    apyBase: number | null;
+    apyReward: number | null;
+  }>;
+  timestamp: number;
+}
+let defiLlamaPoolsCache: DefiLlamaPoolsCache | null = null;
+const DEFILLAMA_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function getDefiLlamaPools(): Promise<DefiLlamaPoolsCache["data"]> {
+  // Return cached data if fresh
+  if (defiLlamaPoolsCache && Date.now() - defiLlamaPoolsCache.timestamp < DEFILLAMA_CACHE_TTL_MS) {
+    console.error(`[clara] Using cached DeFiLlama pools data`);
+    return defiLlamaPoolsCache.data;
+  }
+
+  console.error(`[clara] Fetching DeFiLlama pools (this may take a moment)...`);
+  const response = await fetch(`${DEFILLAMA_YIELDS_API}/pools`);
+  if (!response.ok) {
+    throw new Error(`DeFiLlama API error: ${response.status}`);
+  }
+
+  const result = await response.json() as { data: DefiLlamaPoolsCache["data"] };
+
+  // Cache the result
+  defiLlamaPoolsCache = {
+    data: result.data,
+    timestamp: Date.now(),
+  };
+
+  console.error(`[clara] Cached ${result.data.length} pools from DeFiLlama`);
+  return result.data;
+}
+
 // Aave v3 Pool addresses per chain
 const AAVE_V3_POOLS: Record<string, { pool: string; poolDataProvider: string } | null> = {
   ethereum: {
@@ -4415,31 +4457,19 @@ export async function getYieldOpportunities(
   console.error(`[clara] Fetching yields for ${asset} on ${chains.join(", ")}`);
 
   try {
-    const response = await fetch(`${DEFILLAMA_YIELDS_API}/pools`);
-    if (!response.ok) {
-      throw new Error(`DeFiLlama API error: ${response.status}`);
-    }
-
-    const data = (await response.json()) as {
-      data: Array<{
-        pool: string;
-        chain: string;
-        project: string;
-        symbol: string;
-        tvlUsd: number;
-        apy: number;
-        apyBase: number | null;
-        apyReward: number | null;
-        stablecoin: boolean;
-        underlyingTokens: string[];
-      }>;
-    };
+    // Use cached DeFiLlama pools data
+    const pools = await getDefiLlamaPools();
 
     // Filter for matching opportunities
     const assetUpper = asset.toUpperCase();
     const opportunities: YieldOpportunity[] = [];
 
-    for (const pool of data.data) {
+    for (const pool of pools) {
+      // Type assertion for additional fields
+      const poolData = pool as typeof pool & {
+        stablecoin?: boolean;
+        underlyingTokens?: string[];
+      };
       // Check chain
       const chainLower = pool.chain.toLowerCase();
       if (!chains.includes(chainLower as SupportedChain)) continue;
@@ -4462,8 +4492,8 @@ export async function getYieldOpportunities(
         apyReward: pool.apyReward,
         apyTotal: pool.apy || 0,
         tvlUsd: pool.tvlUsd,
-        stablecoin: pool.stablecoin,
-        underlyingTokens: pool.underlyingTokens || [],
+        stablecoin: poolData.stablecoin || false,
+        underlyingTokens: poolData.underlyingTokens || [],
       });
     }
 
@@ -4783,32 +4813,27 @@ export async function getYieldPositions(
     throw new Error("Not authenticated");
   }
 
-  const positions: YieldPosition[] = [];
+  console.error(`[clara] Checking yield positions (parallelized)...`);
+  const startTime = Date.now();
 
-  // Collect all positions with balances (without prices yet)
-  const positionsWithoutPrice: Array<{
-    protocol: string;
+  // Step 1: Build list of all balance checks to perform
+  interface BalanceCheckTask {
     protocolId: string;
+    protocolName: string;
     chain: SupportedChain;
     symbol: string;
-    receiptTokenAddress: string;
-    balance: string;
-    balanceRaw: string;
-    underlying: { address: string } | null;
-    currentApy: number;
-  }> = [];
+    receiptToken: string;
+  }
 
-  // Check each protocol
+  const balanceCheckTasks: BalanceCheckTask[] = [];
+
   for (const protocolId of protocols) {
     const adapter = getProtocolAdapter(protocolId);
     if (!adapter) continue;
 
-    // Check each chain for this protocol
     for (const chain of chains) {
       if (!adapter.supportedChains.includes(chain)) continue;
 
-      // Get assets to check for this protocol/chain
-      // For Aave, check aTokens; for Compound, check Comet balances
       const assetsToCheck = getAssetsForProtocol(protocolId, chain);
 
       for (const symbol of assetsToCheck) {
@@ -4817,63 +4842,85 @@ export async function getYieldPositions(
           continue;
         }
 
-        try {
-          const balance = await getTokenBalance(receiptToken, chain, session.address);
-          const balanceNum = parseFloat(balance.balance);
-
-          if (balanceNum > 0.0001) { // Only show positions above dust
-            const underlying = resolveToken(symbol, chain);
-            const yields = await getYieldOpportunities(symbol, {
-              chains: [chain],
-              protocols: [protocolId],
-            });
-            const currentApy = yields[0]?.apyTotal || 0;
-
-            positionsWithoutPrice.push({
-              protocol: adapter.displayName,
-              protocolId,
-              chain,
-              symbol,
-              receiptTokenAddress: receiptToken,
-              balance: balance.balance,
-              balanceRaw: balance.balanceRaw,
-              underlying,
-              currentApy,
-            });
-          }
-        } catch (error) {
-          console.error(`[clara] Error checking ${symbol} in ${adapter.displayName} on ${chain}:`, error);
-          continue;
-        }
+        balanceCheckTasks.push({
+          protocolId,
+          protocolName: adapter.displayName,
+          chain,
+          symbol,
+          receiptToken,
+        });
       }
     }
   }
 
-  // Batch fetch prices for all position symbols
-  const symbols = [...new Set(positionsWithoutPrice.map(p => p.symbol))];
-  const prices = await getTokenPricesUsd(symbols);
+  console.error(`[clara] Checking ${balanceCheckTasks.length} receipt token balances in parallel...`);
 
-  // Build final positions with USD values
-  for (const pos of positionsWithoutPrice) {
-    const price = prices[pos.symbol];
-    const balanceNum = parseFloat(pos.balance);
-    const valueUsd = price !== undefined
-      ? (balanceNum * price).toFixed(2)
-      : "—";
+  // Step 2: Run ALL balance checks in parallel
+  const balanceResults = await Promise.all(
+    balanceCheckTasks.map(async (task) => {
+      try {
+        const balance = await getTokenBalance(task.receiptToken, task.chain, session.address!);
+        return { ...task, balance, error: null };
+      } catch (error) {
+        return { ...task, balance: null, error };
+      }
+    })
+  );
 
-    positions.push({
-      protocol: pos.protocol,
-      chain: pos.chain,
-      asset: pos.symbol,
-      assetAddress: pos.underlying?.address || "",
-      aTokenAddress: pos.receiptTokenAddress, // Keep field name for compatibility
-      deposited: pos.balance,
-      depositedRaw: pos.balanceRaw,
-      currentApy: pos.currentApy,
-      valueUsd,
-    });
+  // Step 3: Filter to non-zero balances
+  const nonZeroPositions = balanceResults.filter((r) => {
+    if (r.error || !r.balance) return false;
+    const balanceNum = parseFloat(r.balance.balance);
+    return balanceNum > 0.0001; // Above dust threshold
+  });
+
+  console.error(`[clara] Found ${nonZeroPositions.length} positions with balances`);
+
+  if (nonZeroPositions.length === 0) {
+    console.error(`[clara] Position check completed in ${Date.now() - startTime}ms`);
+    return [];
   }
 
+  // Step 4: Fetch APYs for positions with balances (in parallel)
+  const positionsWithApy = await Promise.all(
+    nonZeroPositions.map(async (pos) => {
+      try {
+        const yields = await getYieldOpportunities(pos.symbol, {
+          chains: [pos.chain],
+          protocols: [pos.protocolId],
+        });
+        return { ...pos, currentApy: yields[0]?.apyTotal || 0 };
+      } catch {
+        return { ...pos, currentApy: 0 };
+      }
+    })
+  );
+
+  // Step 5: Batch fetch prices for all position symbols
+  const symbols = [...new Set(positionsWithApy.map((p) => p.symbol))];
+  const prices = await getTokenPricesUsd(symbols);
+
+  // Step 6: Build final positions with USD values
+  const positions: YieldPosition[] = positionsWithApy.map((pos) => {
+    const underlying = resolveToken(pos.symbol, pos.chain);
+    const price = prices[pos.symbol];
+    const balanceNum = parseFloat(pos.balance!.balance);
+    const valueUsd = price !== undefined ? (balanceNum * price).toFixed(2) : "—";
+
+    return {
+      protocol: pos.protocolName,
+      chain: pos.chain,
+      asset: pos.symbol,
+      assetAddress: underlying?.address || "",
+      aTokenAddress: pos.receiptToken,
+      deposited: pos.balance!.balance,
+      depositedRaw: pos.balance!.balanceRaw,
+      currentApy: pos.currentApy,
+      valueUsd,
+    };
+  });
+
+  console.error(`[clara] Position check completed in ${Date.now() - startTime}ms`);
   return positions;
 }
 
