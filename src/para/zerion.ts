@@ -369,6 +369,206 @@ function formatOperationType(type: ZerionTransaction["attributes"]["operation_ty
 // Format Transaction for Display
 // ============================================
 
+// ============================================
+// Portfolio Positions Types
+// ============================================
+
+interface ZerionPosition {
+  type: "positions";
+  id: string;
+  attributes: {
+    parent: null | string;
+    protocol: null | string;
+    name: string;
+    position_type: "wallet" | "staked" | "deposit" | "locked" | "reward";
+    quantity: {
+      int: string;
+      decimals: number;
+      float: number;
+      numeric: string;
+    };
+    value: number | null; // USD value
+    price: number; // Price per token in USD
+    changes: {
+      absolute_1d: number | null;
+      percent_1d: number | null;
+    } | null;
+    fungible_info: {
+      name: string;
+      symbol: string;
+      icon: { url: string } | null;
+      flags: {
+        verified: boolean;
+      };
+      implementations: Array<{
+        chain_id: string;
+        address: string | null; // null for native tokens
+        decimals: number;
+      }>;
+    };
+  };
+  relationships: {
+    chain: {
+      data: {
+        type: "chains";
+        id: string; // e.g., "base", "ethereum"
+      };
+    };
+    fungible: {
+      data: {
+        type: "fungibles";
+        id: string;
+      };
+    };
+  };
+}
+
+interface ZerionPositionsResponse {
+  links: {
+    self: string;
+    next?: string;
+  };
+  data: ZerionPosition[];
+}
+
+// ============================================
+// Portfolio Position Types (for Clara)
+// ============================================
+
+export interface PortfolioPosition {
+  chain: string;
+  symbol: string;
+  name: string;
+  balance: string;
+  balanceRaw: string;
+  decimals: number;
+  priceUsd: number | null;
+  valueUsd: number | null;
+  change24h: number | null;
+  changePercent24h: number | null;
+  contractAddress: string | null; // null for native tokens
+  isVerified: boolean;
+  positionType: "wallet" | "staked" | "deposit" | "locked" | "reward";
+  protocol: string | null;
+}
+
+export interface ZerionPortfolio {
+  positions: PortfolioPosition[];
+  totalValueUsd: number;
+  totalChange24hUsd: number | null;
+  totalChangePercent24h: number | null;
+  lastUpdated: string;
+  source: "zerion";
+}
+
+// ============================================
+// Get Portfolio Positions (All Chains, One Call!)
+// ============================================
+
+/**
+ * Fetch all token positions across all EVM chains in ONE API call
+ *
+ * This is the key optimization - replaces 5+ RPC calls with 1 Zerion call
+ *
+ * @param address - Wallet address
+ * @param options - Filter options
+ * @returns Portfolio with all positions across all chains
+ */
+export async function getPortfolioZerion(
+  address: string,
+  options: {
+    includeStaked?: boolean; // Include staked/deposited positions (default: true)
+    minValueUsd?: number;    // Filter out dust (default: 0.01)
+  } = {}
+): Promise<ZerionPortfolio> {
+  const { includeStaked = true, minValueUsd = 0.01 } = options;
+
+  if (!ZERION_API_KEY) {
+    throw new Error("Zerion API key not configured");
+  }
+
+  console.error(`[zerion] Fetching portfolio for ${address.slice(0, 8)}...`);
+
+  const params: Record<string, string> = {
+    "currency": "usd",
+    "filter[positions]": includeStaked ? "no_filter" : "only_simple",
+    "filter[trash]": "only_non_trash", // Filter out spam tokens
+    "sort": "value", // Sort by USD value descending
+  };
+
+  const response = await zerionFetch<ZerionPositionsResponse>(
+    `/wallets/${address}/positions`,
+    params
+  );
+
+  // Transform to our format
+  const positions: PortfolioPosition[] = [];
+  let totalValueUsd = 0;
+  let totalChange24hUsd = 0;
+  let hasChangeData = false;
+
+  for (const pos of response.data) {
+    const attrs = pos.attributes;
+    const valueUsd = attrs.value ?? 0;
+
+    // Skip dust
+    if (valueUsd < minValueUsd && valueUsd > 0) {
+      continue;
+    }
+
+    // Get contract address for this chain
+    const chainId = pos.relationships.chain.data.id;
+    const impl = attrs.fungible_info.implementations.find(
+      i => i.chain_id === chainId
+    );
+
+    const position: PortfolioPosition = {
+      chain: chainId,
+      symbol: attrs.fungible_info.symbol,
+      name: attrs.fungible_info.name,
+      balance: attrs.quantity.float.toString(),
+      balanceRaw: attrs.quantity.numeric,
+      decimals: attrs.quantity.decimals,
+      priceUsd: attrs.price > 0 ? attrs.price : null,
+      valueUsd: valueUsd > 0 ? valueUsd : null,
+      change24h: attrs.changes?.absolute_1d ?? null,
+      changePercent24h: attrs.changes?.percent_1d ?? null,
+      contractAddress: impl?.address ?? null,
+      isVerified: attrs.fungible_info.flags.verified,
+      positionType: attrs.position_type,
+      protocol: attrs.protocol,
+    };
+
+    positions.push(position);
+    totalValueUsd += valueUsd;
+
+    if (attrs.changes?.absolute_1d !== null) {
+      totalChange24hUsd += attrs.changes?.absolute_1d ?? 0;
+      hasChangeData = true;
+    }
+  }
+
+  // Calculate percent change
+  const totalChangePercent24h = hasChangeData && totalValueUsd > 0
+    ? (totalChange24hUsd / (totalValueUsd - totalChange24hUsd)) * 100
+    : null;
+
+  console.error(`[zerion] Found ${positions.length} positions, total $${totalValueUsd.toFixed(2)}`);
+
+  return {
+    positions,
+    totalValueUsd,
+    totalChange24hUsd: hasChangeData ? totalChange24hUsd : null,
+    totalChangePercent24h,
+    lastUpdated: new Date().toISOString(),
+    source: "zerion",
+  };
+}
+
+// ============================================
+// Format Transaction for Display
+// ============================================
+
 /**
  * Format a transaction for terminal display
  */

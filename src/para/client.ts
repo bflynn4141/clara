@@ -28,8 +28,10 @@ import {
   getTransactionHistoryZerion,
   formatTransactionZerion,
   isZerionAvailable,
+  getPortfolioZerion,
   type TransactionHistoryItem as ZerionTransactionHistoryItem,
   type TransactionHistory as ZerionTransactionHistory,
+  type ZerionPortfolio,
 } from "./zerion.js";
 import {
   getSolanaAssets,
@@ -1335,8 +1337,8 @@ async function getAllBalancesFallback(
 }
 
 /**
- * Get complete portfolio using Multicall3 for efficiency
- * Single RPC call per chain instead of many
+ * Get complete portfolio - uses Zerion API when available (1 call vs 5+)
+ * Falls back to Multicall3 per-chain if Zerion unavailable
  */
 export async function getPortfolioFast(): Promise<Portfolio> {
   const session = await getSession();
@@ -1344,7 +1346,38 @@ export async function getPortfolioFast(): Promise<Portfolio> {
     throw new Error("Not authenticated");
   }
 
-  console.error("[clara] Building portfolio via Multicall3...");
+  // Try Zerion first - ONE API call for all EVM chains!
+  if (isZerionAvailable()) {
+    try {
+      console.error("[clara] Building portfolio via Zerion (1 call)...");
+      const zerionPortfolio = await getPortfolioZerion(session.address);
+
+      // Convert Zerion format to our Portfolio format
+      const items: PortfolioItem[] = zerionPortfolio.positions
+        .filter(pos => pos.positionType === "wallet") // Only wallet balances, not staked
+        .map(pos => ({
+          chain: pos.chain as SupportedChain,
+          symbol: pos.symbol,
+          balance: pos.balance,
+          priceUsd: pos.priceUsd,
+          valueUsd: pos.valueUsd,
+          change24h: pos.changePercent24h,
+        }));
+
+      return {
+        items,
+        totalValueUsd: zerionPortfolio.totalValueUsd,
+        totalChange24h: zerionPortfolio.totalChangePercent24h,
+        lastUpdated: zerionPortfolio.lastUpdated,
+      };
+    } catch (error) {
+      console.error("[clara] Zerion failed, falling back to Multicall:", error);
+      // Fall through to Multicall fallback
+    }
+  }
+
+  // Fallback: Multicall3 per chain (5 RPC calls)
+  console.error("[clara] Building portfolio via Multicall3 (5 calls)...");
 
   // Fetch prices
   const prices = await fetchPrices();
