@@ -32,9 +32,12 @@ import {
   sendTransaction,
   checkGasForTransaction,
   executeSwap,
+  getBridgeQuote,
+  executeBridge,
   type SupportedChain,
   type YieldOpportunity,
   type YieldPlan,
+  type BridgeQuote,
 } from "../para/client.js";
 
 const SUPPORTED_CHAINS = ["base", "arbitrum"] as const; // MVP chains
@@ -120,6 +123,8 @@ export function registerEarnTool(server: McpServer) {
       description: `Earn yield on your tokens by depositing into lending protocols.
 
 Clara automatically finds the best yield across Aave v3 and Compound v3 on Base and Arbitrum.
+**Handles cross-chain automatically**: If your funds are on a different chain than the best yield,
+Clara will bridge them for you (auto-bridge enabled by default).
 
 **Check your positions:**
 - action="positions" → Shows current deposits with earnings breakdown
@@ -130,10 +135,10 @@ Clara automatically finds the best yield across Aave v3 and Compound v3 on Base 
 
 **Get a deposit plan:**
 - asset="USDC" → Shows best yield opportunity with chain recommendation
-- asset="USDC", amount="100" → Creates a deposit plan
+- asset="USDC", amount="100" → Creates a deposit plan (shows bridge if needed)
 
 **Execute deposit:**
-- action="deposit", asset="USDC", amount="100" → Deposits (auto-swaps for gas if needed)
+- action="deposit", asset="USDC", amount="100" → Deposits (auto-bridges + auto-swaps for gas)
 
 **Withdraw:**
 - action="withdraw", asset="USDC", amount="50", chain="base" → Withdraw specific amount
@@ -145,10 +150,11 @@ Supported: USDC, USDT, DAI on Base and Arbitrum (Aave v3, Compound v3)`,
         amount: z.string().optional().describe("Amount to deposit/withdraw (omit to just see rates, use 'all' to withdraw everything)"),
         action: z.enum(["plan", "deposit", "withdraw", "positions", "history"]).optional().default("plan").describe("plan = show opportunity, deposit = execute deposit, withdraw = execute withdrawal, positions = show current deposits, history = show transaction history"),
         chain: z.enum(SUPPORTED_CHAINS).optional().describe("Specific chain (required for withdraw)"),
+        autoBridge: z.boolean().optional().default(true).describe("Automatically bridge tokens if they're on a different chain than the best yield (default: true)"),
       },
     },
     async (args) => {
-      const { asset, amount, action = "plan", chain } = args;
+      const { asset, amount, action = "plan", chain, autoBridge = true } = args;
 
       try {
         const session = await getSession();
@@ -187,9 +193,60 @@ Supported: USDC, USDT, DAI on Base and Arbitrum (Aave v3, Compound v3)`,
           return await showYieldOpportunities(asset, chains);
         }
 
-        // Check balance first
+        // Check balance across all chains
         const balanceCheck = await checkAssetBalance(asset, amount, chains, session.address);
-        if (!balanceCheck.sufficient) {
+
+        // Get best yield opportunity to compare chains
+        const opportunities = await getYieldOpportunities(asset, { chains });
+        const bestYield = opportunities.sort((a, b) => b.apyTotal - a.apyTotal)[0];
+
+        // Determine if we need to bridge
+        let needsBridge = false;
+        let bridgeFromChain: SupportedChain | undefined;
+        let bridgeToChain: SupportedChain | undefined;
+        let bridgeQuote: BridgeQuote | undefined;
+
+        if (balanceCheck.sufficient && balanceCheck.chain && bestYield) {
+          // User has funds, check if they're on the best yield chain
+          if (balanceCheck.chain !== bestYield.chain) {
+            needsBridge = true;
+            bridgeFromChain = balanceCheck.chain;
+            bridgeToChain = bestYield.chain as SupportedChain;
+          }
+        } else if (!balanceCheck.sufficient) {
+          // Check if user has funds on ANY chain that could be bridged
+          const nonZeroBalances = Object.entries(balanceCheck.balancesByChain)
+            .filter(([_, bal]) => parseFloat(bal) >= parseFloat(amount))
+            .map(([chain]) => chain as SupportedChain);
+
+          if (nonZeroBalances.length > 0 && bestYield) {
+            // User has enough funds on another chain
+            needsBridge = true;
+            bridgeFromChain = nonZeroBalances[0];
+            bridgeToChain = bestYield.chain as SupportedChain;
+          }
+        }
+
+        // If needs bridge and autoBridge is enabled, get a bridge quote
+        if (needsBridge && autoBridge && bridgeFromChain && bridgeToChain) {
+          try {
+            bridgeQuote = await getBridgeQuote(
+              asset,
+              asset,
+              amount,
+              bridgeFromChain,
+              bridgeToChain,
+              { slippage: 0.5 }
+            );
+          } catch (error) {
+            console.error("[clara] Failed to get bridge quote:", error);
+            // Fall through to normal insufficient balance error
+            needsBridge = false;
+          }
+        }
+
+        // Handle insufficient balance (after bridge check)
+        if (!balanceCheck.sufficient && !needsBridge) {
           // Build a helpful error message with diagnostics
           const lines: string[] = [
             `❌ Insufficient ${asset.toUpperCase()} balance`,
@@ -204,8 +261,8 @@ Supported: USDC, USDT, DAI on Base and Arbitrum (Aave v3, Compound v3)`,
           if (nonZeroBalances.length > 0) {
             lines.push("");
             lines.push("Your balances:");
-            for (const [chain, bal] of nonZeroBalances) {
-              lines.push(`  • ${chain}: ${bal} ${asset.toUpperCase()}`);
+            for (const [chainName, bal] of nonZeroBalances) {
+              lines.push(`  • ${chainName}: ${bal} ${asset.toUpperCase()}`);
             }
           } else {
             lines.push(`Your balance: 0 ${asset.toUpperCase()}`);
@@ -226,8 +283,9 @@ Supported: USDC, USDT, DAI on Base and Arbitrum (Aave v3, Compound v3)`,
           };
         }
 
-        // Create a deposit plan
-        const plan = await createYieldPlan(asset, amount, chains);
+        // Create a deposit plan (use the chain with best yield if bridging)
+        const targetChain = needsBridge && bridgeToChain ? bridgeToChain : balanceCheck.chain;
+        const plan = await createYieldPlan(asset, amount, targetChain ? [targetChain] : chains);
 
         if (!plan) {
           return {
@@ -238,14 +296,66 @@ Supported: USDC, USDT, DAI on Base and Arbitrum (Aave v3, Compound v3)`,
           };
         }
 
-        const planDisplay = formatPlan(plan);
+        // Format plan with bridge info if applicable
+        const planDisplay = formatPlanWithBridge(plan, bridgeQuote, bridgeFromChain, bridgeToChain);
 
         if (action === "plan") {
-          return { content: [{ type: "text" as const, text: planDisplay + "\n\nTo deposit, run again with action=\"deposit\"" }] };
+          const bridgeNote = needsBridge ? "\n\n💡 Bridge + deposit will execute automatically when you run with action=\"deposit\"" : "";
+          return { content: [{ type: "text" as const, text: planDisplay + bridgeNote + "\n\nTo deposit, run again with action=\"deposit\"" }] };
         }
 
-        // Execute the deposit
+        // Execute the deposit (with bridge if needed)
         const outputLines: string[] = [planDisplay, ""];
+
+        // Execute bridge first if needed
+        if (needsBridge && bridgeQuote && bridgeFromChain && bridgeToChain) {
+          outputLines.push(`🌉 Step 1: Bridging ${amount} ${asset.toUpperCase()} from ${capitalizeFirst(bridgeFromChain)} → ${capitalizeFirst(bridgeToChain)}...`);
+          outputLines.push("");
+
+          try {
+            // Check gas on source chain for bridge
+            const bridgeGasResult = await ensureGasForOperation(bridgeFromChain, "deposit"); // Bridge uses similar gas
+            if (!bridgeGasResult.ready) {
+              return { content: [{ type: "text" as const, text: planDisplay + "\n\n" + (bridgeGasResult.message || "Insufficient gas for bridge") }] };
+            }
+            if (bridgeGasResult.swapExecuted && bridgeGasResult.message) {
+              outputLines.push(bridgeGasResult.message, "");
+            }
+
+            // Handle bridge approval if needed
+            if (bridgeQuote.needsApproval && bridgeQuote.approvalAddress) {
+              outputLines.push(`🔐 Bridge approval required...`);
+              const resolved = resolveToken(asset, bridgeFromChain);
+              if (resolved) {
+                const decimals = asset.toUpperCase() === "USDC" || asset.toUpperCase() === "USDT" ? 6 : 18;
+                const approvalData = encodeApproveCalldata(bridgeQuote.approvalAddress, "unlimited", decimals);
+                const approvalResult = await sendTransaction(
+                  resolved.address,
+                  "0",
+                  bridgeFromChain,
+                  undefined,
+                  approvalData
+                );
+                outputLines.push(`✅ Bridge approval submitted: ${approvalResult.txHash}`);
+                outputLines.push(`⏳ Please wait for approval confirmation, then run the command again.`);
+                return { content: [{ type: "text" as const, text: outputLines.join("\n") }] };
+              }
+            }
+
+            // Execute bridge
+            const bridgeResult = await executeBridge(bridgeQuote);
+            outputLines.push(`✅ Bridge initiated: ${bridgeResult.txHash}`);
+            outputLines.push(`⏳ Estimated arrival: ${bridgeResult.estimatedArrival}`);
+            outputLines.push("");
+            outputLines.push(`⚠️ Bridge in progress. Once your ${asset.toUpperCase()} arrives on ${capitalizeFirst(bridgeToChain)}, run this command again to complete the deposit.`);
+            outputLines.push("");
+            outputLines.push(`Check bridge status, then: wallet_earn asset="${asset}" amount="${amount}" action="deposit" chain="${bridgeToChain}"`);
+
+            return { content: [{ type: "text" as const, text: outputLines.join("\n") }] };
+          } catch (error) {
+            return { content: [{ type: "text" as const, text: `❌ Bridge failed: ${error instanceof Error ? error.message : "Unknown error"}` }] };
+          }
+        }
 
         if (plan.needsApproval) {
           const gasResult = await ensureGasForOperation(plan.chain, "approve");
@@ -452,6 +562,65 @@ function formatPlan(plan: YieldPlan): string {
   lines.push(`📈 Estimated annual earnings: ~${annualEarnings.toFixed(2)} ${plan.asset}`);
 
   return lines.join("\n");
+}
+
+/**
+ * Format a yield plan with bridge step if needed
+ */
+function formatPlanWithBridge(
+  plan: YieldPlan,
+  bridgeQuote?: BridgeQuote,
+  fromChain?: SupportedChain,
+  toChain?: SupportedChain
+): string {
+  if (!bridgeQuote || !fromChain || !toChain) {
+    return formatPlan(plan);
+  }
+
+  const tvlStr = (plan.tvlUsd / 1_000_000).toFixed(1);
+
+  const lines: string[] = [
+    `🌉 Bridge + Deposit Plan`,
+    "",
+    `Your ${plan.amount} ${plan.asset} is on ${capitalizeFirst(fromChain)}, but best yield is on ${capitalizeFirst(toChain)}.`,
+    "",
+    `┌─────────────────────────────────────────────────────────────┐`,
+    `│  Step 1: Bridge                                             │`,
+    `│  ${plan.amount} ${plan.asset} from ${capitalizeFirst(fromChain)} → ${capitalizeFirst(toChain)}`.padEnd(62) + `│`,
+    `│  Est. Time: ${formatDuration(bridgeQuote.estimatedTime)}`.padEnd(62) + `│`,
+    `│  Est. Cost: ~$${bridgeQuote.estimatedGasUsd}`.padEnd(62) + `│`,
+    `├─────────────────────────────────────────────────────────────┤`,
+    `│  Step 2: Deposit                                            │`,
+    `│  Into ${plan.protocol} on ${capitalizeFirst(toChain)}`.padEnd(62) + `│`,
+    `│  APY: ${plan.apy.toFixed(2)}%`.padEnd(62) + `│`,
+    `│  Pool TVL: $${tvlStr}M`.padEnd(62) + `│`,
+    `│  Est. Gas: ~$${plan.estimatedGasUsd}`.padEnd(62) + `│`,
+    `└─────────────────────────────────────────────────────────────┘`,
+  ];
+
+  const annualEarnings = parseFloat(plan.amount) * (plan.apy / 100);
+  lines.push("");
+  lines.push(`📈 Estimated annual earnings: ~${annualEarnings.toFixed(2)} ${plan.asset}`);
+
+  const totalGas = parseFloat(bridgeQuote.estimatedGasUsd) + parseFloat(plan.estimatedGasUsd);
+  lines.push(`💸 Total estimated cost: ~$${totalGas.toFixed(2)}`);
+
+  return lines.join("\n");
+}
+
+/**
+ * Format duration in seconds to human-readable string
+ */
+function formatDuration(seconds: number): string {
+  if (seconds < 60) {
+    return `~${seconds} seconds`;
+  } else if (seconds < 3600) {
+    const minutes = Math.ceil(seconds / 60);
+    return `~${minutes} minute${minutes > 1 ? "s" : ""}`;
+  } else {
+    const hours = Math.ceil(seconds / 3600);
+    return `~${hours} hour${hours > 1 ? "s" : ""}`;
+  }
 }
 
 /**
