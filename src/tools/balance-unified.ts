@@ -26,6 +26,10 @@ import {
   type SupportedChain,
   type PortfolioItem,
 } from "../para/client.js";
+import {
+  isZerionAvailable,
+  getPortfolioZerion,
+} from "../para/zerion.js";
 
 const EVM_CHAINS: SupportedChain[] = ["ethereum", "base", "arbitrum", "optimism", "polygon"];
 const ALL_CHAINS = ["ethereum", "base", "arbitrum", "optimism", "polygon", "solana"] as const;
@@ -240,7 +244,7 @@ async function showFullPortfolio(
 }
 
 /**
- * All balances on a specific chain
+ * All balances on a specific chain - uses Zerion for EVM (1 call with chain filter)
  */
 async function showChainBalances(
   chain: SupportedChain,
@@ -285,13 +289,43 @@ async function showChainBalances(
       lines.push(`Error fetching Solana balances: ${error instanceof Error ? error.message : "Unknown"}`);
     }
   } else {
-    // EVM chain
-    const balances = await getBalances(chain);
+    // EVM chain - try Zerion first, fall back to Multicall
+    let foundBalances = false;
 
-    for (const b of balances) {
-      if (parseFloat(b.balance) > 0 || showEmpty) {
-        const valueStr = b.usdValue ? ` (~$${b.usdValue})` : "";
-        lines.push(`${b.symbol}: ${b.balance}${valueStr}`);
+    if (isZerionAvailable()) {
+      try {
+        const portfolio = await getPortfolioZerion(address, { minValueUsd: 0 });
+        const chainPositions = portfolio.positions.filter(
+          pos => pos.chain === chain && pos.positionType === "wallet"
+        );
+
+        for (const pos of chainPositions) {
+          if (parseFloat(pos.balance) > 0 || showEmpty) {
+            foundBalances = true;
+            const valueStr = pos.valueUsd ? ` (~$${formatUsd(pos.valueUsd)})` : "";
+            lines.push(`${pos.symbol}: ${pos.balance}${valueStr}`);
+          }
+        }
+
+        if (chainPositions.length > 0) {
+          foundBalances = true;
+        }
+      } catch (error) {
+        console.error("[wallet_balance] Zerion failed for chain balance:", error);
+        // Fall through to Multicall
+      }
+    }
+
+    // Fallback to Multicall if Zerion unavailable or failed
+    if (!foundBalances) {
+      const balances = await getBalances(chain);
+
+      for (const b of balances) {
+        if (parseFloat(b.balance) > 0 || showEmpty) {
+          foundBalances = true;
+          const valueStr = b.usdValue ? ` (~$${b.usdValue})` : "";
+          lines.push(`${b.symbol}: ${b.balance}${valueStr}`);
+        }
       }
     }
 
@@ -312,7 +346,7 @@ async function showChainBalances(
 }
 
 /**
- * Specific token across all chains
+ * Specific token across all chains - uses Zerion for efficiency (1 call vs 5)
  */
 async function showTokenAcrossChains(
   token: string,
@@ -327,57 +361,82 @@ async function showTokenAcrossChains(
   let totalValue = 0;
   let foundAny = false;
 
-  // Check each chain
-  const checks = EVM_CHAINS.map(async (chain): Promise<{ chain: string; balance: string; valueUsd: number | null } | null> => {
+  // Try Zerion first - ONE API call for all EVM chains!
+  if (isZerionAvailable() && tokenUpper !== "SOL") {
     try {
-      if (isNative && tokenUpper === "ETH") {
-        // Native ETH on EVM chains (except Polygon which uses MATIC)
-        if (chain === "polygon") return null;
-        const balances = await getBalances(chain);
-        const ethBalance = balances.find(b => b.symbol === "ETH");
-        if (ethBalance && (parseFloat(ethBalance.balance) > 0 || showEmpty)) {
-          return { chain, balance: ethBalance.balance, valueUsd: parseFloat(ethBalance.usdValue || "0") };
-        }
-      } else if (isNative && tokenUpper === "MATIC") {
-        if (chain !== "polygon") return null;
-        const balances = await getBalances(chain);
-        const maticBalance = balances.find(b => b.symbol === "MATIC");
-        if (maticBalance && (parseFloat(maticBalance.balance) > 0 || showEmpty)) {
-          return { chain, balance: maticBalance.balance, valueUsd: parseFloat(maticBalance.usdValue || "0") };
-        }
-      } else {
-        // ERC-20 token
-        const resolved = resolveToken(token, chain);
-        if (!resolved) return null;
+      const portfolio = await getPortfolioZerion(address, { minValueUsd: 0 });
 
-        const balance = await getTokenBalance(resolved.address, chain, address);
-        if (parseFloat(balance.balance) > 0 || showEmpty) {
-          // Estimate USD value for stablecoins
-          const valueUsd = ["USDC", "USDT", "DAI"].includes(tokenUpper)
-            ? parseFloat(balance.balance)
-            : null;
-          return { chain, balance: balance.balance, valueUsd };
+      // Filter for the requested token
+      const tokenPositions = portfolio.positions.filter(
+        pos => pos.symbol.toUpperCase() === tokenUpper && pos.positionType === "wallet"
+      );
+
+      for (const pos of tokenPositions) {
+        if (parseFloat(pos.balance) > 0 || showEmpty) {
+          foundAny = true;
+          const chainDisplay = pos.chain.charAt(0).toUpperCase() + pos.chain.slice(1);
+          const valueStr = pos.valueUsd ? ` (~$${formatUsd(pos.valueUsd)})` : "";
+          lines.push(`${chainDisplay}: ${pos.balance} ${tokenUpper}${valueStr}`);
+          totalValue += pos.valueUsd || 0;
         }
       }
-    } catch {
-      // Token not available on this chain
-    }
-    return null;
-  });
-
-  const results = await Promise.all(checks);
-
-  for (const result of results) {
-    if (result) {
-      foundAny = true;
-      const chainDisplay = result.chain.charAt(0).toUpperCase() + result.chain.slice(1);
-      const valueStr = result.valueUsd ? ` (~$${formatUsd(result.valueUsd)})` : "";
-      lines.push(`${chainDisplay}: ${result.balance} ${tokenUpper}${valueStr}`);
-      if (result.valueUsd) totalValue += result.valueUsd;
+    } catch (error) {
+      console.error("[wallet_balance] Zerion failed, falling back to per-chain:", error);
+      // Fall through to per-chain fallback below
+      foundAny = false;
+      totalValue = 0;
     }
   }
 
-  // Check Solana for SOL
+  // Fallback: Per-chain checks (only if Zerion unavailable or failed)
+  if (!foundAny && !isZerionAvailable()) {
+    const checks = EVM_CHAINS.map(async (chain): Promise<{ chain: string; balance: string; valueUsd: number | null } | null> => {
+      try {
+        if (isNative && tokenUpper === "ETH") {
+          if (chain === "polygon") return null;
+          const balances = await getBalances(chain);
+          const ethBalance = balances.find(b => b.symbol === "ETH");
+          if (ethBalance && (parseFloat(ethBalance.balance) > 0 || showEmpty)) {
+            return { chain, balance: ethBalance.balance, valueUsd: parseFloat(ethBalance.usdValue || "0") };
+          }
+        } else if (isNative && tokenUpper === "MATIC") {
+          if (chain !== "polygon") return null;
+          const balances = await getBalances(chain);
+          const maticBalance = balances.find(b => b.symbol === "MATIC");
+          if (maticBalance && (parseFloat(maticBalance.balance) > 0 || showEmpty)) {
+            return { chain, balance: maticBalance.balance, valueUsd: parseFloat(maticBalance.usdValue || "0") };
+          }
+        } else {
+          const resolved = resolveToken(token, chain);
+          if (!resolved) return null;
+          const balance = await getTokenBalance(resolved.address, chain, address);
+          if (parseFloat(balance.balance) > 0 || showEmpty) {
+            const valueUsd = ["USDC", "USDT", "DAI"].includes(tokenUpper)
+              ? parseFloat(balance.balance)
+              : null;
+            return { chain, balance: balance.balance, valueUsd };
+          }
+        }
+      } catch {
+        // Token not available on this chain
+      }
+      return null;
+    });
+
+    const results = await Promise.all(checks);
+
+    for (const result of results) {
+      if (result) {
+        foundAny = true;
+        const chainDisplay = result.chain.charAt(0).toUpperCase() + result.chain.slice(1);
+        const valueStr = result.valueUsd ? ` (~$${formatUsd(result.valueUsd)})` : "";
+        lines.push(`${chainDisplay}: ${result.balance} ${tokenUpper}${valueStr}`);
+        if (result.valueUsd) totalValue += result.valueUsd;
+      }
+    }
+  }
+
+  // Check Solana for SOL (Zerion doesn't cover Solana well)
   if (tokenUpper === "SOL" && solanaAddress) {
     try {
       const solanaPortfolio = await getSolanaAssets(solanaAddress);
