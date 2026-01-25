@@ -123,7 +123,7 @@ export class CompoundV3Adapter implements ProtocolAdapter {
   /**
    * Get the Comet market address for a specific asset on a chain
    */
-  getPoolAddress(chain: SupportedChain, asset?: string): string | null {
+  getPoolAddress(chain: SupportedChain, asset?: string | null): string | null {
     const markets = COMET_MARKETS[chain];
     if (!markets) return null;
 

@@ -19,6 +19,18 @@
  * - wallet_simulate: Preview what a transaction will do
  * - wallet_token_balance: Check ERC-20 token balances
  * - wallet_history: View transaction history
+ * - wallet_swap: Swap tokens via DEX aggregation (Li.Fi + 0x)
+ * - wallet_bridge: Bridge tokens across chains (supports cross-chain swaps)
+ * - wallet_earn: Earn yield on tokens via lending protocols
+ * - wallet_rewards: View and claim Boost.xyz rewards
+ *
+ * App Tokenization:
+ * - wallet_create_app_token: Deploy a tokenized app with bonding curve
+ * - wallet_buy_app_token: Buy tokens on the bonding curve
+ * - wallet_sell_app_token: Sell tokens back to the curve
+ * - wallet_claim_dividends: Claim your revenue share
+ * - wallet_app_token_info: View token stats and your position
+ * - wallet_distribute_revenue: (Creators) Share revenue with holders
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -26,6 +38,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { registerSetupTool } from "./tools/setup.js";
+import { registerRestoreTool } from "./tools/restore.js";
 import { registerStatusTool } from "./tools/status.js";
 import { registerAddressTool } from "./tools/address.js";
 import { registerBalanceTool } from "./tools/balance.js";
@@ -40,7 +53,9 @@ import { registerTokenBalanceTool } from "./tools/token-balance.js";
 import { registerHistoryTool } from "./tools/history.js";
 import { registerApprovalsTool } from "./tools/approvals.js";
 import { registerSwapTool } from "./tools/swap.js";
+import { registerBridgeTool } from "./tools/bridge.js";
 import { registerEarnTool } from "./tools/earn.js";
+import { registerAppTokenTools } from "./tools/app-token.js";
 
 // Create MCP server instance
 const server = new McpServer({
@@ -50,6 +65,7 @@ const server = new McpServer({
 
 // Register all wallet tools
 registerSetupTool(server);
+registerRestoreTool(server);
 registerStatusTool(server);
 registerAddressTool(server);
 registerBalanceTool(server);
@@ -64,7 +80,9 @@ registerTokenBalanceTool(server);
 registerHistoryTool(server);
 registerApprovalsTool(server);
 registerSwapTool(server);
+registerBridgeTool(server);
 registerEarnTool(server);
+registerAppTokenTools(server);
 
 // Start the server
 async function main() {

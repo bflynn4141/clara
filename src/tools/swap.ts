@@ -17,16 +17,16 @@ import { z } from "zod";
 import { getSession } from "../storage/session.js";
 import {
   getSwapQuote,
+  getSwapQuoteBest,
   executeSwap,
-  getSwappableTokens,
   encodeApproveCalldata,
   getTokenMetadata,
   sendTransaction,
   getTokenBalance,
   getBalances,
+  resolveToken,
   type SupportedChain,
   type SwapQuote,
-  NATIVE_TOKEN_ADDRESS,
 } from "../para/client.js";
 
 const SUPPORTED_CHAINS = ["ethereum", "base", "arbitrum", "optimism", "polygon"] as const;
@@ -79,19 +79,38 @@ Supported tokens: ETH, MATIC, USDC, USDT, DAI, WETH, WBTC (or any contract addre
         // Check balance first
         const balanceCheck = await checkBalance(fromToken, amount, chain as SupportedChain, session.address);
         if (!balanceCheck.sufficient) {
+          const capitalChain = chain.charAt(0).toUpperCase() + chain.slice(1);
+          const lines: string[] = [
+            `❌ Insufficient ${fromToken.toUpperCase()} on ${capitalChain}`,
+            "",
+            `You want to swap: ${amount} ${fromToken.toUpperCase()}`,
+            `Your balance: ${balanceCheck.balance} ${fromToken.toUpperCase()}`,
+            "",
+            "💡 Options:",
+          ];
+
+          if (parseFloat(balanceCheck.balance) > 0) {
+            lines.push(`  • Swap available balance: wallet_swap fromToken="${fromToken}" toToken="${toToken}" amount="${balanceCheck.balance}" chain="${chain}"`);
+          }
+          lines.push(`  • Bridge from another chain: wallet_bridge fromToken="${fromToken.toUpperCase()}" toChain="${chain}"`);
+          lines.push(`  • Receive tokens: Send ${fromToken.toUpperCase()} to ${session.address}`);
+
           return {
             content: [{
               type: "text" as const,
-              text: `❌ Insufficient balance\n\n` +
-                `You want to swap: ${amount} ${fromToken.toUpperCase()}\n` +
-                `Your balance: ${balanceCheck.balance} ${fromToken.toUpperCase()}\n\n` +
-                `Please reduce the amount or add more ${fromToken.toUpperCase()} to your wallet.`
+              text: lines.join("\n")
             }]
           };
         }
 
-        // Get quote
-        const quote = await getSwapQuote(fromToken, toToken, amount, chain as SupportedChain, slippage);
+        // Get best quote from multiple aggregators (Li.Fi + 0x)
+        const quote = await getSwapQuoteBest(
+          fromToken,
+          toToken,
+          amount,
+          chain as SupportedChain,
+          { slippage }
+        );
 
         // Format quote for display
         const quoteDisplay = formatQuote(quote, chain as SupportedChain);
@@ -116,14 +135,22 @@ Supported tokens: ETH, MATIC, USDC, USDT, DAI, WETH, WBTC (or any contract addre
         // Execute the swap
         const result = await executeSwap(quote, chain as SupportedChain);
 
+        // Build success message
+        const successLines: string[] = [
+          formatQuote(quote, chain as SupportedChain),
+          "",
+          `✅ Swap submitted!`,
+          "",
+          `Transaction: ${result.txHash}`,
+          `Status: ${result.status}`,
+          "",
+          `Your ${quote.toToken.symbol} will arrive shortly.`,
+        ];
+
         return {
           content: [{
             type: "text" as const,
-            text: quoteDisplay + "\n\n" +
-              `✅ Swap submitted!\n\n` +
-              `Transaction: ${result.txHash}\n` +
-              `Status: ${result.status}\n\n` +
-              `Your ${quote.toToken.symbol} will arrive shortly.`
+            text: successLines.join("\n")
           }]
         };
 
@@ -168,8 +195,13 @@ async function checkBalance(
     if (token.startsWith("0x")) {
       tokenAddress = token;
     } else {
-      const metadata = await getTokenMetadata(token, chain);
-      tokenAddress = metadata.address;
+      // Use resolveToken to properly convert symbol to address
+      const resolved = resolveToken(token, chain);
+      if (!resolved) {
+        // Token not supported on this chain
+        return { sufficient: false, balance: "0" };
+      }
+      tokenAddress = resolved.address;
     }
 
     const tokenBalance = await getTokenBalance(tokenAddress, chain, address);
@@ -179,8 +211,7 @@ async function checkBalance(
       balance: tokenBalance.balance,
     };
   } catch {
-    // If we can't check balance, assume sufficient and let the swap fail if not
-    return { sufficient: true, balance: "unknown" };
+    return { sufficient: false, balance: "0" };
   }
 }
 
@@ -188,11 +219,12 @@ async function checkBalance(
  * Format a swap quote for display
  */
 function formatQuote(quote: SwapQuote, chain: SupportedChain): string {
+  const sourceLabel = quote.source === "0x" ? "0x" : "Li.Fi";
   const lines: string[] = [
-    `🔄 Swap Quote on ${capitalizeFirst(chain)}`,
+    `🔄 Swap Quote on ${capitalizeFirst(chain)} (via ${sourceLabel})`,
     "",
-    `**You send:** ${quote.fromAmount} ${quote.fromToken.symbol} (~$${quote.fromAmountUsd})`,
-    `**You receive:** ${quote.toAmount} ${quote.toToken.symbol} (~$${quote.toAmountUsd})`,
+    `**You send:** ${quote.fromAmount} ${quote.fromToken.symbol}${quote.fromAmountUsd !== "0" ? ` (~$${quote.fromAmountUsd})` : ""}`,
+    `**You receive:** ${quote.toAmount} ${quote.toToken.symbol}${quote.toAmountUsd !== "0" ? ` (~$${quote.toAmountUsd})` : ""}`,
     `**Minimum:** ${quote.toAmountMin} ${quote.toToken.symbol} (after slippage)`,
     "",
     `**Rate:** 1 ${quote.fromToken.symbol} = ${quote.exchangeRate} ${quote.toToken.symbol}`,

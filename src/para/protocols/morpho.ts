@@ -42,29 +42,43 @@ const MAX_UINT256 = BigInt(
 /**
  * Known MetaMorpho vault addresses
  *
+ * Sourced from Morpho Blue API (https://blue-api.morpho.org/graphql)
  * These are curated vaults with significant TVL and professional management.
  * The adapter can work with any ERC-4626 vault address.
+ *
+ * Vault symbols from DeFiLlama are case-insensitive matched.
  */
 const MORPHO_VAULTS: Partial<Record<SupportedChain, Record<string, string>>> = {
   base: {
-    // Steakhouse USDC - Flagship vault by Steakhouse Financial
-    STEAKUSDC: "0x6ABfd6139c7C3CC270ee2Ce132E309F59cAaF6a2",
-    // Gauntlet USDC Prime - Managed by Gauntlet
-    GTUSDCP: "0x12AfDe9a6FEAfb0c1C06B7EC8D58c47542c9E656",
-    // Spark USDC Vault
+    // Steakhouse Prime USDC - $451M TVL, ~4% APY
+    STEAKUSDC: "0xBEEFE94c8aD530842bfE7d8B397938fFc1cb83b2",
+    // Gauntlet USDC Prime - $395M TVL, ~4% APY
+    GTUSDCP: "0xeE8F4eC5672F09119b96Ab6fB59C27E1b7e44b61",
+    // Spark USDC Vault - $33M TVL, ~4% APY
     SPARKUSDC: "0x7BfA7C4f149E7415b73bdeDfe609237e29CBF34A",
-    // Seamless USDC Vault
+    // Seamless USDC Vault - $28M TVL, ~4% APY
+    SMUSDC: "0x616a4E1db48e22028f6bbf20444Cd3b8e3273738",
     SEAMLESSUSDC: "0x616a4E1db48e22028f6bbf20444Cd3b8e3273738",
-    // Default USDC vault (highest TVL)
-    USDC: "0x6ABfd6139c7C3CC270ee2Ce132E309F59cAaF6a2",
+    // Moonwell Flagship USDC - $24M TVL, ~4% APY
+    MWUSDC: "0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca",
+    // Pangolins USDC - $13M TVL, ~4% APY
+    PUSDC: "0x1401d1271C47648AC70cBcdfA3776D4A87CE006B",
+    // Gauntlet USDC Frontier - $11M TVL, ~4% APY
+    GTUSDCF: "0x236919F11ff9eA9550A4287696C2FC9e18E6e890",
+    // Froge's USDC - $33M TVL
+    FRUSDC: "0x2C6D169782bF18Cc634D076Fe639092227B82fdA",
+    // Default USDC vault (highest TVL - Steakhouse Prime)
+    USDC: "0xBEEFE94c8aD530842bfE7d8B397938fFc1cb83b2",
   },
   arbitrum: {
-    // BBQ USDC - Arbitrum native vault
-    BBQUSDC: "0x8F25d6AE3ACB22C40D4F76e36c0C2a7A2fB7c1F5",
-    // Gauntlet USDC Core
-    GTUSDCC: "0x8A8B6A1C9b8d5e3F7a1B2c3D4e5f6A7b8C9d0E1f",
-    // Default USDC vault
-    USDC: "0x8F25d6AE3ACB22C40D4F76e36c0C2a7A2fB7c1F5",
+    // Steakhouse High Yield USDC (BBQ) - $52M TVL, ~3.5% APY
+    BBQUSDC: "0x5c0C306Aaa9F877de636f4d5822cA9F2E81563BA",
+    // Gauntlet USDC Core - $41M TVL, ~5.2% APY
+    GTUSDCC: "0x7e97fa6893871A2751B5fE961978DCCb2c201E65",
+    // Hyperithm USDC - $20M TVL, ~7.4% APY (highest yield!)
+    HYPERUSDC: "0x4B6F1C9E5d470b97181786b26da0d0945A7cf027",
+    // Default USDC vault (highest TVL - BBQ)
+    USDC: "0x5c0C306Aaa9F877de636f4d5822cA9F2E81563BA",
   },
   ethereum: {
     // Steakhouse USDC - Original flagship vault
@@ -171,9 +185,12 @@ export class MorphoAdapter implements ProtocolAdapter {
    * deposit(uint256 assets, address receiver) returns (uint256 shares)
    */
   encodeSupply(params: SupplyParams): EncodedTransaction {
-    const vaultAddress = this.getPoolAddress(params.chain, params.assetAddress);
+    // Use poolSymbol if provided (from DeFiLlama), otherwise fall back to asset lookup
+    const vaultAddress = params.poolSymbol
+      ? this.getPoolAddress(params.chain, params.poolSymbol)
+      : this.getPoolAddress(params.chain);
     if (!vaultAddress) {
-      throw new Error(`Morpho vault not available for ${params.assetAddress} on ${params.chain}`);
+      throw new Error(`Morpho vault not available for ${params.poolSymbol || "USDC"} on ${params.chain}`);
     }
 
     // Pad amount (32 bytes) - assets to deposit

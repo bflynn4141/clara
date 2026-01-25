@@ -12,8 +12,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import * as crypto from "crypto";
 import * as os from "os";
-import { getSession, saveSession } from "../storage/session.js";
-import { createPregenWallet, completeWalletSetup, type PregenIdentifier } from "../para/client.js";
+import { getSession, updateSession } from "../storage/session.js";
+import { createPregenWallet, completeWalletSetup, repairMissingWalletId, type PregenIdentifier } from "../para/client.js";
 
 /**
  * Generate a machine-specific UUID for zero-friction setup
@@ -41,6 +41,17 @@ export function registerSetupTool(server: McpServer) {
         // Check if already authenticated
         const existingSession = await getSession();
         if (existingSession?.authenticated) {
+          // Repair session if walletId is missing (fixes signing capability)
+          let repairNote = "";
+          if (!existingSession.walletId) {
+            const repaired = await repairMissingWalletId();
+            if (repaired) {
+              repairNote = "\n\n🔧 Session repaired - signing now enabled!";
+            } else {
+              repairNote = "\n\n⚠️ Could not repair signing capability. Try wallet_logout then wallet_setup again.";
+            }
+          }
+
           const identifierInfo = existingSession.email
             ? `Linked to: ${existingSession.email}`
             : `Local wallet (machine-specific)`;
@@ -53,7 +64,8 @@ export function registerSetupTool(server: McpServer) {
                 `${identifierInfo}\n` +
                 `Chains: ${existingSession.chains?.join(", ") || "EVM, Solana"}\n\n` +
                 `Use wallet_get_balance or wallet_send to interact.\n` +
-                `Use wallet_logout to clear and create a new wallet.`
+                `Use wallet_logout to clear and create a new wallet.` +
+                repairNote
             }]
           };
         }
@@ -71,8 +83,8 @@ export function registerSetupTool(server: McpServer) {
         // Complete setup (retrieves wallet info)
         const walletResult = await completeWalletSetup(createResult.sessionId);
 
-        // Save session
-        await saveSession({
+        // Update session (merge, don't overwrite - preserves walletId from createPregenWallet)
+        await updateSession({
           authenticated: true,
           address: walletResult.address,
           solanaAddress: walletResult.solanaAddress,
@@ -80,8 +92,6 @@ export function registerSetupTool(server: McpServer) {
           identifierType: identifier.type,
           identifier: identifier.value,
           chains: ["ethereum", "base", "arbitrum", "optimism", "polygon", "solana"],
-          createdAt: new Date().toISOString(),
-          lastActiveAt: new Date().toISOString(),
         });
 
         const isNew = walletResult.isNewWallet;

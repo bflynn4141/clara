@@ -51,6 +51,7 @@ export interface SupplyParams {
   decimals: number;
   onBehalfOf: string;  // Recipient of receipt tokens
   chain: SupportedChain;
+  poolSymbol?: string; // Pool/vault symbol from DeFiLlama (e.g., "HYPERUSDC" for Morpho)
 }
 
 export interface WithdrawParams {

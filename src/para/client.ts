@@ -24,6 +24,21 @@ import {
   getSupportedProtocols,
   type ProtocolAdapter,
 } from "./protocols/index.js";
+import {
+  getTransactionHistoryZerion,
+  formatTransactionZerion,
+  isZerionAvailable,
+  type TransactionHistoryItem as ZerionTransactionHistoryItem,
+  type TransactionHistory as ZerionTransactionHistory,
+} from "./zerion.js";
+import {
+  getSolanaAssets,
+  getSolanaTransactions,
+  isHeliusAvailable,
+  type SolanaBalance,
+  type SolanaPortfolio,
+  type SolanaTransaction,
+} from "./solana.js";
 
 // Types
 export interface TokenBalance {
@@ -95,6 +110,297 @@ const EXPLORER_CONFIG: Record<SupportedChain, { apiUrl: string; explorerUrl: str
 // Default: Uses Clara proxy which injects API key
 // Override with PARA_API_URL env var for direct API access with your own key
 const PARA_API_BASE = process.env.PARA_API_URL || "https://clara-proxy.bflynn-me.workers.dev/api";
+
+// ============================================
+// RLP Encoding for EIP-1559 Transactions
+// ============================================
+
+/**
+ * Encode a single item for RLP
+ * - Bytes 0-55: 0x80 + length prefix
+ * - Bytes > 55: 0xb7 + length-of-length prefix
+ */
+function rlpEncodeBytes(data: Uint8Array): Uint8Array {
+  if (data.length === 1 && data[0] < 0x80) {
+    return data;
+  }
+  if (data.length <= 55) {
+    const result = new Uint8Array(1 + data.length);
+    result[0] = 0x80 + data.length;
+    result.set(data, 1);
+    return result;
+  }
+  const lengthBytes = bigIntToBytes(BigInt(data.length));
+  const result = new Uint8Array(1 + lengthBytes.length + data.length);
+  result[0] = 0xb7 + lengthBytes.length;
+  result.set(lengthBytes, 1);
+  result.set(data, 1 + lengthBytes.length);
+  return result;
+}
+
+/**
+ * Convert BigInt to minimal bytes (big-endian, no leading zeros)
+ */
+function bigIntToBytes(value: bigint): Uint8Array {
+  if (value === 0n) return new Uint8Array(0);
+  let hex = value.toString(16);
+  if (hex.length % 2) hex = "0" + hex;
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+/**
+ * Convert hex string to Uint8Array
+ */
+function hexToBytes(hex: string): Uint8Array {
+  const cleanHex = hex.startsWith("0x") ? hex.slice(2) : hex;
+  if (cleanHex.length === 0) return new Uint8Array(0);
+  const padded = cleanHex.length % 2 ? "0" + cleanHex : cleanHex;
+  const bytes = new Uint8Array(padded.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(padded.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+/**
+ * Convert Uint8Array to hex string with 0x prefix
+ */
+function bytesToHex(bytes: Uint8Array): string {
+  return "0x" + Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Encode an EIP-1559 (type 2) unsigned transaction for signing
+ * Returns: 0x02 || RLP([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList])
+ */
+function encodeUnsignedEIP1559Tx(tx: {
+  chainId: number;
+  nonce: number;
+  maxPriorityFeePerGas: bigint;
+  maxFeePerGas: bigint;
+  gasLimit: bigint;
+  to: string;
+  value: bigint;
+  data: string;
+}): Uint8Array {
+  // Encode each field individually
+  const encodedFields: Uint8Array[] = [
+    rlpEncodeBytes(bigIntToBytes(BigInt(tx.chainId))),
+    rlpEncodeBytes(bigIntToBytes(BigInt(tx.nonce))),
+    rlpEncodeBytes(bigIntToBytes(tx.maxPriorityFeePerGas)),
+    rlpEncodeBytes(bigIntToBytes(tx.maxFeePerGas)),
+    rlpEncodeBytes(bigIntToBytes(tx.gasLimit)),
+    rlpEncodeBytes(hexToBytes(tx.to)),
+    rlpEncodeBytes(bigIntToBytes(tx.value)),
+    rlpEncodeBytes(hexToBytes(tx.data)),
+    new Uint8Array([0xc0]), // Empty access list = RLP empty list
+  ];
+
+  // Calculate total length of encoded fields
+  const totalLength = encodedFields.reduce((sum, f) => sum + f.length, 0);
+
+  // Encode as RLP list
+  let rlpEncoded: Uint8Array;
+  if (totalLength <= 55) {
+    rlpEncoded = new Uint8Array(1 + totalLength);
+    rlpEncoded[0] = 0xc0 + totalLength;
+    let offset = 1;
+    for (const field of encodedFields) {
+      rlpEncoded.set(field, offset);
+      offset += field.length;
+    }
+  } else {
+    const lengthBytes = bigIntToBytes(BigInt(totalLength));
+    rlpEncoded = new Uint8Array(1 + lengthBytes.length + totalLength);
+    rlpEncoded[0] = 0xf7 + lengthBytes.length;
+    rlpEncoded.set(lengthBytes, 1);
+    let offset = 1 + lengthBytes.length;
+    for (const field of encodedFields) {
+      rlpEncoded.set(field, offset);
+      offset += field.length;
+    }
+  }
+
+  // Prepend type byte (0x02 for EIP-1559)
+  const result = new Uint8Array(1 + rlpEncoded.length);
+  result[0] = 0x02;
+  result.set(rlpEncoded, 1);
+  return result;
+}
+
+/**
+ * Encode a signed EIP-1559 transaction for broadcast
+ * Returns: 0x02 || RLP([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, v, r, s])
+ */
+function encodeSignedEIP1559Tx(tx: {
+  chainId: number;
+  nonce: number;
+  maxPriorityFeePerGas: bigint;
+  maxFeePerGas: bigint;
+  gasLimit: bigint;
+  to: string;
+  value: bigint;
+  data: string;
+  v: number;
+  r: bigint;
+  s: bigint;
+}): Uint8Array {
+  // Encode each field individually
+  const encodedFields: Uint8Array[] = [
+    rlpEncodeBytes(bigIntToBytes(BigInt(tx.chainId))),
+    rlpEncodeBytes(bigIntToBytes(BigInt(tx.nonce))),
+    rlpEncodeBytes(bigIntToBytes(tx.maxPriorityFeePerGas)),
+    rlpEncodeBytes(bigIntToBytes(tx.maxFeePerGas)),
+    rlpEncodeBytes(bigIntToBytes(tx.gasLimit)),
+    rlpEncodeBytes(hexToBytes(tx.to)),
+    rlpEncodeBytes(bigIntToBytes(tx.value)),
+    rlpEncodeBytes(hexToBytes(tx.data)),
+    new Uint8Array([0xc0]), // Empty access list = RLP empty list
+    rlpEncodeBytes(bigIntToBytes(BigInt(tx.v))),
+    rlpEncodeBytes(bigIntToBytes(tx.r)),
+    rlpEncodeBytes(bigIntToBytes(tx.s)),
+  ];
+
+  // Calculate total length
+  const totalLength = encodedFields.reduce((sum, f) => sum + f.length, 0);
+
+  // Encode as RLP list
+  let rlpEncoded: Uint8Array;
+  if (totalLength <= 55) {
+    rlpEncoded = new Uint8Array(1 + totalLength);
+    rlpEncoded[0] = 0xc0 + totalLength;
+    let offset = 1;
+    for (const field of encodedFields) {
+      rlpEncoded.set(field, offset);
+      offset += field.length;
+    }
+  } else {
+    const lengthBytes = bigIntToBytes(BigInt(totalLength));
+    rlpEncoded = new Uint8Array(1 + lengthBytes.length + totalLength);
+    rlpEncoded[0] = 0xf7 + lengthBytes.length;
+    rlpEncoded.set(lengthBytes, 1);
+    let offset = 1 + lengthBytes.length;
+    for (const field of encodedFields) {
+      rlpEncoded.set(field, offset);
+      offset += field.length;
+    }
+  }
+
+  // Prepend type byte (0x02 for EIP-1559)
+  const result = new Uint8Array(1 + rlpEncoded.length);
+  result[0] = 0x02;
+  result.set(rlpEncoded, 1);
+  return result;
+}
+
+/**
+ * Parse a 65-byte signature into r, s, v components
+ * Format: r (32 bytes) + s (32 bytes) + v (1 byte)
+ */
+function parseSignature(sig: string): { r: bigint; s: bigint; v: number } {
+  const cleanSig = sig.startsWith("0x") ? sig.slice(2) : sig;
+  if (cleanSig.length !== 130) {
+    throw new Error(`Invalid signature length: expected 130 hex chars, got ${cleanSig.length}`);
+  }
+  const r = BigInt("0x" + cleanSig.slice(0, 64));
+  const s = BigInt("0x" + cleanSig.slice(64, 128));
+  let v = parseInt(cleanSig.slice(128, 130), 16);
+
+  // Normalize v: Para may return 27/28, but EIP-1559 uses 0/1
+  if (v >= 27) v -= 27;
+
+  return { r, s, v };
+}
+
+/**
+ * Internal: Get the current nonce for an address
+ */
+async function fetchNonce(address: string, chain: SupportedChain): Promise<number> {
+  const config = CHAIN_CONFIG[chain];
+  const response = await fetch(config.rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method: "eth_getTransactionCount",
+      params: [address, "pending"],
+      id: 1,
+    }),
+  });
+
+  const result = await response.json() as { result?: string; error?: { message: string } };
+  if (result.error) {
+    throw new Error(`Failed to get nonce: ${result.error.message}`);
+  }
+  return parseInt(result.result || "0x0", 16);
+}
+
+/**
+ * Internal: Estimate gas limit for a transaction
+ */
+async function fetchGasLimit(tx: { to: string; from: string; value?: string; data?: string }, chain: SupportedChain): Promise<bigint> {
+  const config = CHAIN_CONFIG[chain];
+  const response = await fetch(config.rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method: "eth_estimateGas",
+      params: [{
+        to: tx.to,
+        from: tx.from,
+        value: tx.value || "0x0",
+        data: tx.data || "0x",
+      }],
+      id: 1,
+    }),
+  });
+
+  const result = await response.json() as { result?: string; error?: { message: string } };
+  if (result.error) {
+    // Default to 21000 for simple transfers, higher for contract calls
+    return tx.data && tx.data !== "0x" ? 100000n : 21000n;
+  }
+  // Add 20% buffer
+  return BigInt(result.result || "0x5208") * 120n / 100n;
+}
+
+/**
+ * Internal: Get current gas prices
+ */
+async function fetchGasPrices(chain: SupportedChain): Promise<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }> {
+  const config = CHAIN_CONFIG[chain];
+
+  // Get base fee from latest block
+  const blockResponse = await fetch(config.rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method: "eth_getBlockByNumber",
+      params: ["latest", false],
+      id: 1,
+    }),
+  });
+
+  const blockResult = await blockResponse.json() as { result?: { baseFeePerGas?: string } };
+  const baseFee = BigInt(blockResult.result?.baseFeePerGas || "0x3b9aca00"); // Default 1 gwei
+
+  // Set priority fee (tip) - 0.1 gwei for L2s, 1 gwei for mainnet
+  const priorityFee = chain === "ethereum" ? 1000000000n : 100000000n;
+
+  // Max fee = 2 * base fee + priority fee (gives room for base fee increases)
+  const maxFee = baseFee * 2n + priorityFee;
+
+  return {
+    maxFeePerGas: maxFee,
+    maxPriorityFeePerGas: priorityFee,
+  };
+}
 
 // ENS Contract Addresses (Ethereum Mainnet)
 const ENS_REGISTRY = "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e";
@@ -320,9 +626,28 @@ async function paraFetch(
   });
 
   if (!response.ok) {
-    const error = await response.text();
-    console.error(`[clara] API error: ${response.status} - ${error}`);
-    throw new Error(`Para API error: ${response.status} - ${error}`);
+    const errorText = await response.text();
+    console.error(`[clara] API error: ${response.status} - ${errorText}`);
+
+    // For 409 Conflict, try to parse wallet info from response
+    if (response.status === 409) {
+      try {
+        const errorJson = JSON.parse(errorText);
+        // Some APIs return the existing resource on conflict
+        if (errorJson.wallet) {
+          console.error(`[clara] 409 response contains wallet info: ${errorJson.wallet.id}`);
+          // Create a fake "ok" response with the wallet data
+          return new Response(JSON.stringify(errorJson), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      } catch {
+        // Not JSON or no wallet info, continue with error
+      }
+    }
+
+    throw new Error(`Para API error: ${response.status} - ${errorText}`);
   }
 
   return response;
@@ -536,6 +861,63 @@ export async function completeWalletSetup(
 }
 
 /**
+ * Repair a session that is missing walletId
+ * This can happen if the session was created with an older version
+ * or if there was a bug in the setup flow.
+ *
+ * Returns true if repair was successful, false otherwise.
+ */
+export async function repairMissingWalletId(): Promise<boolean> {
+  const session = await getSession();
+
+  if (!session?.authenticated) {
+    console.error("[clara] Cannot repair: not authenticated");
+    return false;
+  }
+
+  if (session.walletId) {
+    console.error("[clara] Session already has walletId, no repair needed");
+    return true;
+  }
+
+  // Build identifier from session
+  const identifier: PregenIdentifier | null = session.identifier
+    ? {
+        type: session.identifierType === 'email' ? 'email' : 'customId',
+        value: session.identifier,
+      }
+    : session.email
+      ? { type: 'email', value: session.email }
+      : null;
+
+  if (!identifier) {
+    console.error("[clara] Cannot repair: no identifier in session");
+    return false;
+  }
+
+  console.error(`[clara] Repairing session - fetching walletId for ${identifier.type}: ${identifier.value}`);
+
+  try {
+    const wallets = await fetchWalletsForIdentifier(identifier);
+
+    if (wallets.evm) {
+      await updateSession({
+        walletId: wallets.evm.id,
+        solanaWalletId: wallets.solana?.id,
+      });
+      console.error(`[clara] Repair successful - walletId: ${wallets.evm.id}`);
+      return true;
+    }
+
+    console.error("[clara] Repair failed: no EVM wallet found for identifier");
+    return false;
+  } catch (error) {
+    console.error("[clara] Repair failed:", error);
+    return false;
+  }
+}
+
+/**
  * Get wallet address for a specific chain
  */
 export async function getWalletAddress(chain: SupportedChain): Promise<string> {
@@ -568,65 +950,49 @@ export async function getBalances(
     throw new Error("Not authenticated");
   }
 
-  const config = CHAIN_CONFIG[chain];
   console.error(`[clara] Fetching balances for ${chain}`);
 
   try {
     if (chain === "solana") {
-      const solAddress = await getWalletAddress("solana").catch(() => null);
-      if (!solAddress) {
-        return [{ symbol: "SOL", balance: "0.0", usdValue: "N/A" }];
-      }
+      // Use Helius-powered Solana client for rich data (USD prices, SPL tokens)
+      try {
+        const portfolio = await getSolanaAssets();
+        const balances: TokenBalance[] = [];
 
-      const response = await fetch(config.rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getBalance",
-          params: [solAddress],
-        }),
-      });
-
-      const data = (await response.json()) as { result?: { value: number } };
-      const lamports = data.result?.value || 0;
-      const solBalance = lamports / 1e9;
-
-      return [
-        {
+        // Add native SOL
+        balances.push({
           symbol: "SOL",
-          balance: solBalance.toFixed(6),
-          usdValue: undefined,
-        },
-      ];
+          balance: portfolio.nativeBalance.balance,
+          usdValue: portfolio.nativeBalance.valueUsd?.toFixed(2),
+        });
+
+        // Add SPL tokens
+        for (const token of portfolio.tokens) {
+          balances.push({
+            symbol: token.symbol,
+            balance: token.balance,
+            usdValue: token.valueUsd?.toFixed(2),
+            contractAddress: token.mintAddress,
+          });
+        }
+
+        return balances;
+      } catch (error) {
+        console.error("[clara] Solana balance fetch failed:", error);
+        return [{ symbol: "SOL", balance: "0.0", usdValue: undefined }];
+      }
     }
 
-    // EVM balance check via RPC
-    const response = await fetch(config.rpcUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        method: "eth_getBalance",
-        params: [session.address, "latest"],
-        id: 1,
-      }),
-    });
+    // EVM chains: Use Multicall3 to fetch native + all ERC-20 tokens in one call
+    const multiBalances = await getAllBalancesMulticall(chain);
 
-    const data = (await response.json()) as { result?: string };
-    const balanceWei = BigInt(data.result || "0");
-    const balanceEth = Number(balanceWei) / 1e18;
-
-    const symbol = chain === "polygon" ? "MATIC" : "ETH";
-
-    return [
-      {
-        symbol,
-        balance: balanceEth.toFixed(6),
-        usdValue: undefined,
-      },
-    ];
+    // Convert MultiTokenBalance[] to TokenBalance[]
+    return multiBalances.map(b => ({
+      symbol: b.symbol,
+      balance: b.balance,
+      usdValue: b.usdValue?.toString(),
+      contractAddress: b.contractAddress,
+    }));
   } catch (error) {
     console.error(`[clara] Balance fetch error:`, error);
     return [
@@ -1142,7 +1508,7 @@ export async function signTransaction(
       return { signedTx: signature };
     }
 
-    // EVM transaction signing
+    // EVM transaction signing with proper EIP-1559 encoding
     const evmWalletId = session.walletId;
     if (!evmWalletId) {
       throw new Error("No EVM wallet found");
@@ -1151,34 +1517,76 @@ export async function signTransaction(
     const evmTx = tx as TransactionRequest;
     const config = CHAIN_CONFIG[chain];
 
-    // Build unsigned transaction object
-    const unsignedTx = {
-      to: evmTx.to,
-      value: evmTx.value ? `0x${BigInt(evmTx.value).toString(16)}` : "0x0",
-      data: evmTx.data || "0x",
-      gasLimit: evmTx.gasLimit || "0x5208",
-      maxFeePerGas: evmTx.maxFeePerGas || "0x3b9aca00",
-      maxPriorityFeePerGas: evmTx.maxPriorityFeePerGas || "0x3b9aca00",
+    if (!config.chainId) {
+      throw new Error(`Chain ${chain} does not have a chainId configured`);
+    }
+
+    // Get wallet address for nonce lookup
+    const address = session.address;
+    if (!address) {
+      throw new Error("No wallet address found in session");
+    }
+
+    // Get current nonce, gas prices, and estimate gas
+    const [nonce, gasPrices, gasEstimate] = await Promise.all([
+      fetchNonce(address, chain),
+      fetchGasPrices(chain),
+      fetchGasLimit({ to: evmTx.to, from: address, value: evmTx.value, data: evmTx.data }, chain),
+    ]);
+
+    // Build the transaction object
+    const txParams = {
       chainId: config.chainId,
-      type: 2,
-      nonce: 0,
+      nonce,
+      maxPriorityFeePerGas: evmTx.maxPriorityFeePerGas
+        ? BigInt(evmTx.maxPriorityFeePerGas)
+        : gasPrices.maxPriorityFeePerGas,
+      maxFeePerGas: evmTx.maxFeePerGas
+        ? BigInt(evmTx.maxFeePerGas)
+        : gasPrices.maxFeePerGas,
+      gasLimit: evmTx.gasLimit
+        ? BigInt(evmTx.gasLimit)
+        : gasEstimate,
+      to: evmTx.to,
+      value: evmTx.value ? BigInt(evmTx.value) : 0n,
+      data: evmTx.data || "0x",
     };
 
-    // Sign the transaction data using sign-raw endpoint
-    // For proper EVM tx signing, you'd use RLP encoding here
-    // This is a simplified version - for production, use ethers.js
-    const txDataHex = "0x" + Buffer.from(JSON.stringify(unsignedTx)).toString("hex");
+    // Step 1: Encode unsigned transaction and hash it
+    const unsignedTxBytes = encodeUnsignedEIP1559Tx(txParams);
+    const txHash = keccak_256(unsignedTxBytes);
+    const txHashHex = "0x" + Array.from(txHash).map(b => b.toString(16).padStart(2, "0")).join("");
 
+    // Step 2: Sign the hash with Para
     const response = await paraFetch(`/v1/wallets/${evmWalletId}/sign-raw`, {
       method: "POST",
       body: JSON.stringify({
-        data: txDataHex,
+        data: txHashHex,
       }),
     });
 
-    const result = (await response.json()) as { signature: string };
+    const responseText = await response.text();
+    if (!response.ok) {
+      throw new Error(`Para sign-raw failed: ${response.status} - ${responseText}`);
+    }
+
+    const result = JSON.parse(responseText) as { signature: string };
+
+    // Step 3: Parse signature into r, s, v
+    const { r, s, v } = parseSignature(result.signature);
+
+    // Step 4: Encode the signed transaction
+    const signedTxBytes = encodeSignedEIP1559Tx({
+      ...txParams,
+      v,
+      r,
+      s,
+    });
+
+    const signedTxHex = bytesToHex(signedTxBytes);
+
     return {
-      signedTx: result.signature,
+      signedTx: signedTxHex,
     };
   } catch (error) {
     console.error("[clara] Sign transaction error:", error);
@@ -1254,11 +1662,11 @@ export async function sendTransaction(
 
     const rpcResult = (await response.json()) as {
       result?: string;
-      error?: { message: string };
+      error?: { message: string; code?: number };
     };
 
     if (rpcResult.error) {
-      throw new Error(rpcResult.error.message);
+      throw new Error(`RPC error ${rpcResult.error.code || ''}: ${rpcResult.error.message}`);
     }
 
     return { txHash: rpcResult.result || signed.txHash || "" };
@@ -2149,21 +2557,41 @@ export async function simulateTransaction(
  */
 export interface TransactionHistoryItem {
   hash: string;
+  chain?: string;
   from: string;
   to: string;
-  value: string;
+  value?: string;
   valueEth: number;
   timestamp: number;
   date: string;
   action: string;
-  status: "success" | "failed";
-  gasUsed: string;
-  gasPrice: string;
+  actionType?: string; // 'trade' | 'send' | 'receive' | 'approve' | etc.
+  status: "success" | "failed" | "pending";
+  gasUsed?: string;
+  gasPrice?: string;
+  gasUsedEth?: number;
+  gasUsedUsd?: number;
   functionName?: string;
   tokenSymbol?: string;
   tokenAmount?: string;
-  isIncoming: boolean;
+  isIncoming?: boolean;
   explorerUrl: string;
+  dappName?: string;
+  // Rich transfer data from Zerion
+  transfers?: Array<{
+    direction: "in" | "out" | "self";
+    symbol: string;
+    name: string;
+    amount: number;
+    usdValue: number | null;
+    isNft: boolean;
+  }>;
+  // Token approvals
+  approvals?: Array<{
+    symbol: string;
+    spender: string;
+    amount: number | "unlimited";
+  }>;
 }
 
 /**
@@ -2177,7 +2605,10 @@ export interface TransactionHistory {
 }
 
 /**
- * Fetch transaction history from block explorer API
+ * Fetch transaction history
+ *
+ * Uses Zerion API if ZERION_API_KEY is set (richer data, more reliable)
+ * Falls back to block explorer APIs otherwise (basic but works without key)
  */
 export async function getTransactionHistory(
   chain: SupportedChain,
@@ -2195,7 +2626,6 @@ export async function getTransactionHistory(
   const address = session.address.toLowerCase();
 
   if (chain === "solana") {
-    // Solana history not yet supported
     return {
       transactions: [],
       address: session.solanaAddress || address,
@@ -2204,19 +2634,69 @@ export async function getTransactionHistory(
     };
   }
 
+  // Try Zerion first if API key is configured
+  if (isZerionAvailable()) {
+    try {
+      const zerionResult = await getTransactionHistoryZerion(address, chain, { limit });
+
+      const transactions: TransactionHistoryItem[] = zerionResult.transactions.map((tx) => {
+        const hasIncoming = tx.transfers.some((t) => t.direction === "in");
+        const hasOutgoing = tx.transfers.some((t) => t.direction === "out");
+        const isIncoming = hasIncoming && !hasOutgoing;
+
+        const mainTransfer = tx.transfers[0];
+        let tokenSymbol: string | undefined;
+        let tokenAmount: string | undefined;
+
+        if (mainTransfer && mainTransfer.symbol !== "ETH") {
+          tokenSymbol = mainTransfer.symbol;
+          tokenAmount = mainTransfer.amount.toFixed(6);
+        }
+
+        return {
+          hash: tx.hash,
+          chain: tx.chain,
+          from: tx.from,
+          to: tx.to,
+          valueEth: tx.valueEth,
+          timestamp: tx.timestamp,
+          date: tx.date,
+          action: tx.action,
+          actionType: tx.actionType,
+          status: tx.status,
+          gasUsedEth: tx.gasUsedEth,
+          gasUsedUsd: tx.gasUsedUsd,
+          tokenSymbol,
+          tokenAmount,
+          isIncoming,
+          explorerUrl: tx.explorerUrl,
+          dappName: tx.dappName,
+          transfers: tx.transfers,
+          approvals: tx.approvals,
+        };
+      });
+
+      return { transactions, address, chain, hasMore: zerionResult.hasMore };
+    } catch (error) {
+      console.error(`[clara] Zerion API failed, falling back to block explorer:`, error);
+    }
+  }
+
+  // Fallback: Block explorer APIs
+  // NOTE: Etherscan V1 API is deprecated - V2 requires API key
+  // For now, return empty with a helpful message
   const explorer = EXPLORER_CONFIG[chain];
   if (!explorer) {
     throw new Error(`Explorer not configured for ${chain}`);
   }
 
-  console.error(`[clara] Fetching transaction history for ${address} on ${chain}`);
-
+  console.error(`[clara] Fetching history via block explorer for ${address} on ${chain}`);
+  console.error(`[clara] Note: Block explorer APIs now require API keys. Set ZERION_API_KEY for best results.`);
   const transactions: TransactionHistoryItem[] = [];
 
   try {
     // Fetch normal transactions
     const txListUrl = `${explorer.apiUrl}?module=account&action=txlist&address=${address}&startblock=0&endblock=99999999&page=1&offset=${limit}&sort=desc`;
-
     const txResponse = await fetch(txListUrl);
     const txData = (await txResponse.json()) as {
       status: string;
@@ -2241,7 +2721,6 @@ export async function getTransactionHistory(
         const isIncoming = tx.to.toLowerCase() === address;
         const timestamp = parseInt(tx.timeStamp) * 1000;
 
-        // Decode action
         let action = "Contract Call";
         const selector = tx.input?.slice(0, 10) || "0x";
 
@@ -2250,7 +2729,6 @@ export async function getTransactionHistory(
         } else if (FUNCTION_SIGNATURES[selector]) {
           action = FUNCTION_SIGNATURES[selector].name;
         } else if (tx.functionName) {
-          // Extract function name from "functionName(params)"
           action = tx.functionName.split("(")[0];
         }
 
@@ -2278,10 +2756,9 @@ export async function getTransactionHistory(
       }
     }
 
-    // Fetch ERC-20 token transfers if requested
+    // Fetch ERC-20 token transfers
     if (includeTokenTransfers) {
       const tokenTxUrl = `${explorer.apiUrl}?module=account&action=tokentx&address=${address}&startblock=0&endblock=99999999&page=1&offset=${limit}&sort=desc`;
-
       const tokenResponse = await fetch(tokenTxUrl);
       const tokenData = (await tokenResponse.json()) as {
         status: string;
@@ -2293,13 +2770,11 @@ export async function getTransactionHistory(
           timeStamp: string;
           tokenSymbol: string;
           tokenDecimal: string;
-          contractAddress: string;
         }>;
       };
 
       if (tokenData.status === "1" && Array.isArray(tokenData.result)) {
         for (const tx of tokenData.result) {
-          // Skip if we already have this tx from normal list
           if (transactions.some((t) => t.hash === tx.hash)) continue;
 
           const decimals = parseInt(tx.tokenDecimal) || 18;
@@ -2333,26 +2808,16 @@ export async function getTransactionHistory(
       }
     }
 
-    // Sort by timestamp descending
     transactions.sort((a, b) => b.timestamp - a.timestamp);
-
-    // Limit results
-    const limitedTxs = transactions.slice(0, limit);
-
     return {
-      transactions: limitedTxs,
+      transactions: transactions.slice(0, limit),
       address,
       chain,
       hasMore: transactions.length > limit,
     };
   } catch (error) {
     console.error(`[clara] Failed to fetch history:`, error);
-    return {
-      transactions: [],
-      address,
-      chain,
-      hasMore: false,
-    };
+    return { transactions: [], address, chain, hasMore: false };
   }
 }
 
@@ -2360,18 +2825,52 @@ export async function getTransactionHistory(
  * Format a transaction for display
  */
 export function formatTransaction(tx: TransactionHistoryItem): string {
-  const icon = tx.status === "failed" ? "❌" : tx.isIncoming ? "📥" : "📤";
-  const amount = tx.tokenAmount
-    ? `${tx.tokenAmount} ${tx.tokenSymbol}`
-    : tx.valueEth > 0
-    ? `${tx.valueEth.toFixed(4)} ETH`
-    : "";
+  // Status icon
+  const statusIcon = tx.status === "failed" ? "❌" : tx.status === "pending" ? "⏳" : "✓";
 
+  // Direction icon based on action type or isIncoming
+  let dirIcon = "📤";
+  if (tx.actionType === "receive" || tx.isIncoming) {
+    dirIcon = "📥";
+  } else if (tx.actionType === "trade") {
+    dirIcon = "🔄";
+  } else if (tx.actionType === "approve") {
+    dirIcon = "✅";
+  }
+
+  // Build amount string
+  let amount = "";
+  if (tx.transfers && tx.transfers.length > 0) {
+    if (tx.actionType === "trade" && tx.transfers.length >= 2) {
+      // Swap: show both tokens
+      const outTx = tx.transfers.find((t) => t.direction === "out");
+      const inTx = tx.transfers.find((t) => t.direction === "in");
+      if (outTx && inTx) {
+        amount = `${outTx.amount.toFixed(4)} ${outTx.symbol} → ${inTx.amount.toFixed(4)} ${inTx.symbol}`;
+      }
+    } else {
+      // Single transfer
+      const mainTransfer = tx.transfers[0];
+      amount = `${mainTransfer.amount.toFixed(4)} ${mainTransfer.symbol}`;
+      if (mainTransfer.usdValue && mainTransfer.usdValue > 0.01) {
+        amount += ` ($${mainTransfer.usdValue.toFixed(2)})`;
+      }
+    }
+  } else if (tx.tokenAmount) {
+    amount = `${tx.tokenAmount} ${tx.tokenSymbol}`;
+  } else if (tx.valueEth > 0) {
+    amount = `${tx.valueEth.toFixed(4)} ETH`;
+  }
+
+  // Counterparty
   const counterparty = tx.isIncoming
     ? `from ${tx.from.slice(0, 6)}...${tx.from.slice(-4)}`
     : `to ${tx.to.slice(0, 6)}...${tx.to.slice(-4)}`;
 
-  return `${icon} ${tx.action}${amount ? ` (${amount})` : ""} ${counterparty} • ${tx.date}`;
+  // Dapp name if available
+  const via = tx.dappName ? ` via ${tx.dappName}` : "";
+
+  return `${statusIcon} ${dirIcon} ${tx.action}${amount ? ` (${amount})` : ""} ${counterparty}${via} • ${tx.date}`;
 }
 
 // ============================================================================
@@ -2637,30 +3136,42 @@ export function formatApproval(approval: TokenApproval): string {
 }
 
 // ============================================================================
-// Token Swaps (via Li.Fi Aggregator)
+// Token Swaps (Meta-Aggregation: Li.Fi + 0x)
 // ============================================================================
 
 // Li.Fi API - aggregates across multiple DEXs, no API key required
 const LIFI_API = "https://li.quest/v1";
 
-// Map our chain names to Li.Fi chain IDs
-const LIFI_CHAIN_IDS: Record<SupportedChain, number | null> = {
+// 0x Swap API v2 - professional market makers + DEX aggregation
+// API key optional but recommended for higher rate limits
+const ZEROX_API = "https://api.0x.org/swap/allowance-holder";
+const ZEROX_API_KEY = process.env.ZEROX_API_KEY || "";
+
+// Map our chain names to chain IDs (shared by both aggregators)
+const CHAIN_IDS: Record<SupportedChain, number | null> = {
   ethereum: 1,
   base: 8453,
   arbitrum: 42161,
   optimism: 10,
   polygon: 137,
-  solana: null, // Li.Fi doesn't support Solana swaps
+  solana: null, // Neither aggregator supports Solana swaps
 };
+
+// Alias for backward compatibility
+const LIFI_CHAIN_IDS = CHAIN_IDS;
 
 // Native token address placeholder (used by Li.Fi for ETH/MATIC/etc)
 const NATIVE_TOKEN_ADDRESS = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 
+// 0x uses different native token representation
+const ZEROX_NATIVE_TOKEN = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+
 /**
- * Swap quote from Li.Fi aggregator
+ * Swap quote from aggregator (Li.Fi or 0x)
  */
 export interface SwapQuote {
   id: string;
+  source: "lifi" | "0x";  // Which aggregator provided this quote
   fromToken: {
     address: string;
     symbol: string;
@@ -2696,16 +3207,39 @@ export interface SwapQuote {
 }
 
 /**
+ * Options for swap quote request
+ */
+export interface SwapQuoteOptions {
+  /** Max slippage percentage (default 0.5%) */
+  slippage?: number;
+  /** Preferred DEX to route through (for Boost rewards) */
+  preferredDex?: string;
+  /** DEXes to exclude from routing */
+  denyDexes?: string[];
+}
+
+/**
  * Get a swap quote from Li.Fi
  * Finds the best route across multiple DEXs
+ *
+ * @param fromToken - Token to sell (symbol or address)
+ * @param toToken - Token to buy (symbol or address)
+ * @param amount - Amount to swap (human-readable)
+ * @param chain - Blockchain to swap on
+ * @param options - Optional: slippage, preferredDex for Boost routing
  */
 export async function getSwapQuote(
   fromToken: string,
   toToken: string,
   amount: string,
   chain: SupportedChain,
-  slippage: number = 0.5
+  options: SwapQuoteOptions | number = {}
 ): Promise<SwapQuote> {
+  // Handle legacy signature where 5th param was slippage number
+  const opts: SwapQuoteOptions = typeof options === "number"
+    ? { slippage: options }
+    : options;
+  const slippage = opts.slippage ?? 0.5;
   const session = await getSession();
   if (!session?.authenticated || !session.address) {
     throw new Error("Not authenticated");
@@ -2757,7 +3291,7 @@ export async function getSwapQuote(
   // Convert amount to raw units (using precise BigInt parsing)
   const amountRaw = parseAmountToBigInt(amount, fromDecimals);
 
-  console.error(`[clara] Getting swap quote: ${amount} ${fromToken} → ${toToken} on ${chain}`);
+  console.error(`[clara] Getting swap quote: ${amount} ${fromToken} → ${toToken} on ${chain}${opts.preferredDex ? ` (prefer: ${opts.preferredDex})` : ""}`);
 
   // Call Li.Fi quote endpoint
   const params = new URLSearchParams({
@@ -2769,6 +3303,16 @@ export async function getSwapQuote(
     fromAddress: session.address,
     slippage: (slippage / 100).toString(), // Convert percentage to decimal
   });
+
+  // Add Boost-aware routing preferences
+  if (opts.preferredDex) {
+    // Li.Fi uses "dexs" param to limit to specific DEXes
+    params.append("dexs", opts.preferredDex);
+    console.error(`[clara] Boost routing: preferring ${opts.preferredDex}`);
+  }
+  if (opts.denyDexes && opts.denyDexes.length > 0) {
+    params.append("denyExchanges", opts.denyDexes.join(","));
+  }
 
   try {
     const response = await fetch(`${LIFI_API}/quote?${params}`);
@@ -2835,6 +3379,7 @@ export async function getSwapQuote(
 
     return {
       id: data.id,
+      source: "lifi" as const,
       fromToken: {
         address: data.action.fromToken.address,
         symbol: data.action.fromToken.symbol,
@@ -2869,9 +3414,598 @@ export async function getSwapQuote(
       toolDetails: data.toolDetails?.name,
     };
   } catch (error) {
-    console.error(`[clara] Swap quote error:`, error);
+    console.error(`[clara] Li.Fi quote error:`, error);
     throw error;
   }
+}
+
+/**
+ * Get a swap quote from 0x Swap API v2
+ * Provides access to professional market makers + DEX aggregation
+ *
+ * @param fromToken - Token to sell (symbol or address)
+ * @param toToken - Token to buy (symbol or address)
+ * @param amount - Amount to swap (human-readable)
+ * @param chain - Blockchain to swap on
+ * @param options - Optional: slippage
+ */
+async function getSwapQuoteFrom0x(
+  fromToken: string,
+  toToken: string,
+  amount: string,
+  chain: SupportedChain,
+  options: SwapQuoteOptions = {}
+): Promise<SwapQuote> {
+  const slippage = options.slippage ?? 0.5;
+
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  const chainId = CHAIN_IDS[chain];
+  if (!chainId) {
+    throw new Error(`Swaps not supported on ${chain}`);
+  }
+
+  // Resolve token addresses
+  let fromAddress: string;
+  let toAddress: string;
+  let fromDecimals = 18;
+  let toDecimals = 18;
+  let fromSymbol = fromToken;
+  let toSymbol = toToken;
+
+  const nativeSymbols = ["ETH", "MATIC", "NATIVE"];
+
+  if (nativeSymbols.includes(fromToken.toUpperCase())) {
+    fromAddress = ZEROX_NATIVE_TOKEN;
+    fromSymbol = chain === "polygon" ? "MATIC" : "ETH";
+  } else if (fromToken.startsWith("0x")) {
+    fromAddress = fromToken;
+    const metadata = await getTokenMetadata(fromToken, chain);
+    fromDecimals = metadata.decimals;
+    fromSymbol = metadata.symbol;
+  } else {
+    const resolved = resolveToken(fromToken, chain);
+    if (!resolved) throw new Error(`Unknown token: ${fromToken} on ${chain}`);
+    fromAddress = resolved.address;
+    fromDecimals = resolved.decimals;
+    fromSymbol = resolved.symbol;
+  }
+
+  if (nativeSymbols.includes(toToken.toUpperCase())) {
+    toAddress = ZEROX_NATIVE_TOKEN;
+    toSymbol = chain === "polygon" ? "MATIC" : "ETH";
+  } else if (toToken.startsWith("0x")) {
+    toAddress = toToken;
+    const metadata = await getTokenMetadata(toToken, chain);
+    toDecimals = metadata.decimals;
+    toSymbol = metadata.symbol;
+  } else {
+    const resolved = resolveToken(toToken, chain);
+    if (!resolved) throw new Error(`Unknown token: ${toToken} on ${chain}`);
+    toAddress = resolved.address;
+    toDecimals = resolved.decimals;
+    toSymbol = resolved.symbol;
+  }
+
+  // Convert amount to raw units
+  const amountRaw = parseAmountToBigInt(amount, fromDecimals);
+
+  console.error(`[clara] Getting 0x quote: ${amount} ${fromSymbol} → ${toSymbol} on ${chain}`);
+
+  // Build 0x API request
+  const params = new URLSearchParams({
+    chainId: chainId.toString(),
+    sellToken: fromAddress,
+    buyToken: toAddress,
+    sellAmount: amountRaw.toString(),
+    taker: session.address,
+    slippageBps: Math.round(slippage * 100).toString(), // Convert % to basis points
+  });
+
+  const headers: Record<string, string> = {
+    "0x-version": "v2",
+  };
+
+  // Add API key if available (for higher rate limits)
+  if (ZEROX_API_KEY) {
+    headers["0x-api-key"] = ZEROX_API_KEY;
+  }
+
+  const response = await fetch(`${ZEROX_API}/quote?${params}`, { headers });
+
+  if (!response.ok) {
+    const error = await response.text();
+    console.error(`[clara] 0x API error: ${response.status} - ${error}`);
+    throw new Error(`0x quote failed: ${response.status}`);
+  }
+
+  const data = await response.json() as {
+    liquidityAvailable: boolean;
+    buyAmount: string;
+    minBuyAmount: string;
+    sellAmount: string;
+    totalNetworkFee: string;
+    transaction: {
+      to: string;
+      data: string;
+      value: string;
+      gas: string;
+    };
+    route: {
+      fills: Array<{ source: string }>;
+    };
+    issues?: {
+      allowance?: { spender: string };
+    };
+  };
+
+  if (!data.liquidityAvailable) {
+    throw new Error("No liquidity available for this swap on 0x");
+  }
+
+  // Calculate amounts
+  const toAmountNum = Number(BigInt(data.buyAmount)) / Math.pow(10, toDecimals);
+  const toAmountMinNum = Number(BigInt(data.minBuyAmount)) / Math.pow(10, toDecimals);
+  const fromAmountNum = parseFloat(amount);
+  const exchangeRate = (toAmountNum / fromAmountNum).toFixed(6);
+
+  // Get gas cost in USD (rough estimate)
+  const gasEstimate = data.transaction?.gas || "200000";
+  const gasCostUsd = (parseInt(gasEstimate) * 0.00000001 * 2500).toFixed(2); // Rough ETH price estimate
+
+  // Check for approval requirement
+  const needsApproval = !!data.issues?.allowance;
+  const approvalAddress = data.issues?.allowance?.spender;
+
+  // Get liquidity sources
+  const sources = [...new Set(data.route?.fills?.map(f => f.source) || [])];
+  const toolDetails = sources.length > 0 ? sources.join(" → ") : "0x";
+
+  return {
+    id: `0x-${Date.now()}`,
+    source: "0x" as const,
+    fromToken: {
+      address: fromAddress,
+      symbol: fromSymbol,
+      decimals: fromDecimals,
+      priceUsd: "0", // 0x doesn't provide USD prices in basic response
+    },
+    toToken: {
+      address: toAddress,
+      symbol: toSymbol,
+      decimals: toDecimals,
+      priceUsd: "0",
+    },
+    fromAmount: amount,
+    fromAmountUsd: "0", // Would need price feed
+    toAmount: toAmountNum.toFixed(toDecimals > 6 ? 6 : toDecimals),
+    toAmountUsd: "0",
+    toAmountMin: toAmountMinNum.toFixed(6),
+    exchangeRate,
+    priceImpact: "0", // 0x doesn't provide this directly
+    estimatedGas: gasEstimate,
+    estimatedGasUsd: gasCostUsd,
+    approvalAddress,
+    needsApproval,
+    transactionRequest: data.transaction ? {
+      to: data.transaction.to,
+      data: data.transaction.data,
+      value: data.transaction.value,
+      gasLimit: data.transaction.gas,
+    } : undefined,
+    tool: "0x",
+    toolDetails,
+  };
+}
+
+/**
+ * Get the best swap quote from multiple aggregators (meta-aggregation)
+ * Queries Li.Fi and 0x in parallel, returns the quote with best output
+ *
+ * @param fromToken - Token to sell (symbol or address)
+ * @param toToken - Token to buy (symbol or address)
+ * @param amount - Amount to swap (human-readable)
+ * @param chain - Blockchain to swap on
+ * @param options - Optional: slippage, preferredDex
+ */
+export async function getSwapQuoteBest(
+  fromToken: string,
+  toToken: string,
+  amount: string,
+  chain: SupportedChain,
+  options: SwapQuoteOptions = {}
+): Promise<SwapQuote> {
+  console.error(`[clara] Meta-aggregation: querying Li.Fi + 0x for best quote...`);
+
+  // Query both aggregators in parallel
+  const [lifiResult, zeroxResult] = await Promise.allSettled([
+    getSwapQuote(fromToken, toToken, amount, chain, options),
+    getSwapQuoteFrom0x(fromToken, toToken, amount, chain, options),
+  ]);
+
+  const quotes: SwapQuote[] = [];
+
+  if (lifiResult.status === "fulfilled") {
+    quotes.push(lifiResult.value);
+    console.error(`[clara] Li.Fi quote: ${lifiResult.value.toAmount} ${lifiResult.value.toToken.symbol}`);
+  } else {
+    console.error(`[clara] Li.Fi failed: ${lifiResult.reason}`);
+  }
+
+  if (zeroxResult.status === "fulfilled") {
+    quotes.push(zeroxResult.value);
+    console.error(`[clara] 0x quote: ${zeroxResult.value.toAmount} ${zeroxResult.value.toToken.symbol}`);
+  } else {
+    console.error(`[clara] 0x failed: ${zeroxResult.reason}`);
+  }
+
+  if (quotes.length === 0) {
+    throw new Error("All aggregators failed to provide a quote");
+  }
+
+  // Find the best quote (highest output amount)
+  const bestQuote = quotes.reduce((best, current) => {
+    const bestAmount = parseFloat(best.toAmount);
+    const currentAmount = parseFloat(current.toAmount);
+    return currentAmount > bestAmount ? current : best;
+  });
+
+  console.error(`[clara] Best quote: ${bestQuote.source} with ${bestQuote.toAmount} ${bestQuote.toToken.symbol}`);
+
+  return bestQuote;
+}
+
+// ============================================================================
+// Cross-Chain Bridging (via Li.Fi)
+// ============================================================================
+
+/**
+ * Bridge quote from Li.Fi (supports bridging + cross-chain swaps)
+ */
+export interface BridgeQuote {
+  id: string;
+  fromChain: SupportedChain;
+  toChain: SupportedChain;
+  fromToken: {
+    address: string;
+    symbol: string;
+    decimals: number;
+    priceUsd: string;
+  };
+  toToken: {
+    address: string;
+    symbol: string;
+    decimals: number;
+    priceUsd: string;
+  };
+  fromAmount: string;
+  fromAmountUsd: string;
+  toAmount: string;
+  toAmountUsd: string;
+  toAmountMin: string;
+  exchangeRate: string;
+  estimatedTime: number; // seconds
+  estimatedGasUsd: string;
+  approvalAddress?: string;
+  needsApproval: boolean;
+  currentAllowance?: string;
+  transactionRequest?: {
+    to: string;
+    data: string;
+    value: string;
+    gasLimit: string;
+  };
+  tool: string;        // Bridge used (e.g., "stargate", "across", "hop")
+  toolDetails?: string;
+  steps: Array<{       // Route breakdown
+    type: "swap" | "bridge" | "cross";
+    tool: string;
+    fromChain: string;
+    toChain: string;
+    fromToken: string;
+    toToken: string;
+  }>;
+}
+
+/**
+ * Options for bridge quote request
+ */
+export interface BridgeQuoteOptions {
+  /** Max slippage percentage (default 0.5%) */
+  slippage?: number;
+  /** Preferred bridges to use */
+  preferredBridges?: string[];
+  /** Bridges to exclude */
+  denyBridges?: string[];
+}
+
+/**
+ * Get a cross-chain bridge quote from Li.Fi
+ * Supports same-token bridging and cross-chain swaps
+ *
+ * @param fromToken - Token to send (symbol or address)
+ * @param toToken - Token to receive (symbol or address, can be different)
+ * @param amount - Amount to bridge (human-readable)
+ * @param fromChain - Source blockchain
+ * @param toChain - Destination blockchain
+ * @param options - Optional: slippage, preferred bridges
+ */
+export async function getBridgeQuote(
+  fromToken: string,
+  toToken: string,
+  amount: string,
+  fromChain: SupportedChain,
+  toChain: SupportedChain,
+  options: BridgeQuoteOptions = {}
+): Promise<BridgeQuote> {
+  const slippage = options.slippage ?? 0.5;
+
+  const session = await getSession();
+  if (!session?.authenticated || !session.address) {
+    throw new Error("Not authenticated");
+  }
+
+  const fromChainId = CHAIN_IDS[fromChain];
+  const toChainId = CHAIN_IDS[toChain];
+
+  if (!fromChainId) {
+    throw new Error(`Bridging not supported from ${fromChain}`);
+  }
+  if (!toChainId) {
+    throw new Error(`Bridging not supported to ${toChain}`);
+  }
+
+  // Resolve source token address
+  let fromAddress: string;
+  const nativeSymbols = ["ETH", "MATIC", "NATIVE"];
+
+  if (nativeSymbols.includes(fromToken.toUpperCase())) {
+    fromAddress = NATIVE_TOKEN_ADDRESS;
+  } else if (fromToken.startsWith("0x")) {
+    fromAddress = fromToken;
+  } else {
+    const resolved = resolveToken(fromToken, fromChain);
+    if (!resolved) {
+      throw new Error(`Unknown token: ${fromToken} on ${fromChain}`);
+    }
+    fromAddress = resolved.address;
+  }
+
+  // Resolve destination token address
+  let toAddress: string;
+  if (nativeSymbols.includes(toToken.toUpperCase())) {
+    toAddress = NATIVE_TOKEN_ADDRESS;
+  } else if (toToken.startsWith("0x")) {
+    toAddress = toToken;
+  } else {
+    const resolved = resolveToken(toToken, toChain);
+    if (!resolved) {
+      throw new Error(`Unknown token: ${toToken} on ${toChain}`);
+    }
+    toAddress = resolved.address;
+  }
+
+  // Get token metadata for amount conversion
+  let fromDecimals = 18;
+  if (fromAddress !== NATIVE_TOKEN_ADDRESS) {
+    const metadata = await getTokenMetadata(fromAddress, fromChain);
+    fromDecimals = metadata.decimals;
+  }
+
+  // Convert amount to raw units
+  const amountRaw = parseAmountToBigInt(amount, fromDecimals);
+
+  const isCrossChainSwap = fromToken.toUpperCase() !== toToken.toUpperCase();
+  const actionType = isCrossChainSwap ? "cross-chain swap" : "bridge";
+  console.error(`[clara] Getting ${actionType} quote: ${amount} ${fromToken} (${fromChain}) → ${toToken} (${toChain})`);
+
+  // Call Li.Fi quote endpoint with different chains
+  const params = new URLSearchParams({
+    fromChain: fromChainId.toString(),
+    toChain: toChainId.toString(),
+    fromToken: fromAddress,
+    toToken: toAddress,
+    fromAmount: amountRaw.toString(),
+    fromAddress: session.address,
+    slippage: (slippage / 100).toString(),
+  });
+
+  // Add bridge preferences
+  if (options.preferredBridges && options.preferredBridges.length > 0) {
+    params.append("bridges", options.preferredBridges.join(","));
+  }
+  if (options.denyBridges && options.denyBridges.length > 0) {
+    params.append("denyBridges", options.denyBridges.join(","));
+  }
+
+  try {
+    const response = await fetch(`${LIFI_API}/quote?${params}`);
+
+    if (!response.ok) {
+      const error = await response.text();
+      console.error(`[clara] Li.Fi bridge API error: ${response.status} - ${error}`);
+      throw new Error(`Bridge quote failed: ${response.status}`);
+    }
+
+    const data = await response.json() as {
+      id: string;
+      action: {
+        fromToken: { address: string; symbol: string; decimals: number; priceUSD: string };
+        toToken: { address: string; symbol: string; decimals: number; priceUSD: string };
+        fromAmount: string;
+        toAmount: string;
+        slippage: number;
+      };
+      estimate: {
+        toAmount: string;
+        toAmountMin: string;
+        fromAmountUSD: string;
+        toAmountUSD: string;
+        gasCosts: Array<{ amountUSD: string; estimate: string }>;
+        executionDuration: number;
+        approvalAddress?: string;
+      };
+      includedSteps: Array<{
+        type: string;
+        tool: string;
+        action: {
+          fromChainId: number;
+          toChainId: number;
+          fromToken: { symbol: string };
+          toToken: { symbol: string };
+        };
+      }>;
+      transactionRequest?: {
+        to: string;
+        data: string;
+        value: string;
+        gasLimit: string;
+      };
+      tool: string;
+      toolDetails?: { name: string };
+    };
+
+    // Calculate exchange rate
+    const fromAmountNum = parseFloat(amount);
+    const toAmountNum = Number(BigInt(data.estimate.toAmount)) / Math.pow(10, data.action.toToken.decimals);
+    const exchangeRate = (toAmountNum / fromAmountNum).toFixed(6);
+
+    // Check if approval is needed
+    let needsApproval = false;
+    let currentAllowance: string | undefined;
+
+    if (fromAddress !== NATIVE_TOKEN_ADDRESS && data.estimate.approvalAddress) {
+      const approval = await getAllowance(fromAddress, data.estimate.approvalAddress, fromChain);
+      const requiredAmount = BigInt(data.action.fromAmount);
+      const currentAmount = BigInt(approval.allowanceRaw);
+      needsApproval = currentAmount < requiredAmount;
+      currentAllowance = approval.allowance;
+    }
+
+    // Sum up gas costs
+    const totalGasUsd = data.estimate.gasCosts.reduce((sum, g) => sum + parseFloat(g.amountUSD || "0"), 0);
+
+    // Build steps array
+    const steps = (data.includedSteps || []).map(step => ({
+      type: step.type as "swap" | "bridge" | "cross",
+      tool: step.tool,
+      fromChain: Object.entries(CHAIN_IDS).find(([, id]) => id === step.action.fromChainId)?.[0] || "unknown",
+      toChain: Object.entries(CHAIN_IDS).find(([, id]) => id === step.action.toChainId)?.[0] || "unknown",
+      fromToken: step.action.fromToken.symbol,
+      toToken: step.action.toToken.symbol,
+    }));
+
+    return {
+      id: data.id,
+      fromChain,
+      toChain,
+      fromToken: {
+        address: data.action.fromToken.address,
+        symbol: data.action.fromToken.symbol,
+        decimals: data.action.fromToken.decimals,
+        priceUsd: data.action.fromToken.priceUSD,
+      },
+      toToken: {
+        address: data.action.toToken.address,
+        symbol: data.action.toToken.symbol,
+        decimals: data.action.toToken.decimals,
+        priceUsd: data.action.toToken.priceUSD,
+      },
+      fromAmount: amount,
+      fromAmountUsd: data.estimate.fromAmountUSD || "0",
+      toAmount: toAmountNum.toFixed(data.action.toToken.decimals > 6 ? 6 : data.action.toToken.decimals),
+      toAmountUsd: data.estimate.toAmountUSD || "0",
+      toAmountMin: (Number(BigInt(data.estimate.toAmountMin)) / Math.pow(10, data.action.toToken.decimals)).toFixed(6),
+      exchangeRate,
+      estimatedTime: data.estimate.executionDuration,
+      estimatedGasUsd: totalGasUsd.toFixed(2),
+      approvalAddress: data.estimate.approvalAddress,
+      needsApproval,
+      currentAllowance,
+      transactionRequest: data.transactionRequest ? {
+        to: data.transactionRequest.to,
+        data: data.transactionRequest.data,
+        value: data.transactionRequest.value,
+        gasLimit: data.transactionRequest.gasLimit,
+      } : undefined,
+      tool: data.tool,
+      toolDetails: data.toolDetails?.name,
+      steps,
+    };
+  } catch (error) {
+    console.error(`[clara] Bridge quote error:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Execute a bridge using the quote's transaction request
+ * Note: This initiates the bridge on the source chain.
+ * The tokens will arrive on the destination chain after the estimated time.
+ */
+export async function executeBridge(
+  quote: BridgeQuote
+): Promise<{ txHash: string; status: string; estimatedArrival: string }> {
+  if (!quote.transactionRequest) {
+    throw new Error("Quote does not include transaction data. Get a fresh quote.");
+  }
+
+  if (quote.needsApproval) {
+    throw new Error(
+      `Approval needed first. Approve ${quote.fromToken.symbol} for spender ${quote.approvalAddress}`
+    );
+  }
+
+  console.error(`[clara] Executing bridge: ${quote.fromAmount} ${quote.fromToken.symbol} (${quote.fromChain}) → ${quote.toToken.symbol} (${quote.toChain})`);
+
+  const txReq = quote.transactionRequest;
+
+  // Sign the transaction
+  const signed = await signTransaction(
+    {
+      to: txReq.to,
+      value: txReq.value ? BigInt(txReq.value).toString() : "0",
+      data: txReq.data,
+      gasLimit: txReq.gasLimit,
+      chainId: CHAIN_CONFIG[quote.fromChain].chainId,
+    },
+    quote.fromChain
+  );
+
+  // Broadcast via RPC
+  const config = CHAIN_CONFIG[quote.fromChain];
+  const response = await fetch(config.rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method: "eth_sendRawTransaction",
+      params: [signed.signedTx],
+      id: 1,
+    }),
+  });
+
+  const result = await response.json() as {
+    result?: string;
+    error?: { message: string };
+  };
+
+  if (result.error) {
+    throw new Error(`Bridge failed: ${result.error.message}`);
+  }
+
+  // Calculate estimated arrival time
+  const arrivalTime = new Date(Date.now() + quote.estimatedTime * 1000);
+  const estimatedArrival = arrivalTime.toLocaleTimeString();
+
+  return {
+    txHash: result.result || "",
+    status: "pending",
+    estimatedArrival,
+  };
 }
 
 /**
@@ -2893,17 +4027,44 @@ export async function executeSwap(
 
   console.error(`[clara] Executing swap: ${quote.fromAmount} ${quote.fromToken.symbol} → ${quote.toToken.symbol}`);
 
-  // Send the swap transaction
-  const result = await sendTransaction(
-    quote.transactionRequest.to,
-    "0", // Value is in the tx data
-    chain,
-    undefined,
-    quote.transactionRequest.data
+  const txReq = quote.transactionRequest;
+
+  // Sign the transaction with the full parameters from the quote
+  const signed = await signTransaction(
+    {
+      to: txReq.to,
+      value: txReq.value ? BigInt(txReq.value).toString() : "0",
+      data: txReq.data,
+      gasLimit: txReq.gasLimit, // Use gas limit from quote
+      chainId: CHAIN_CONFIG[chain].chainId,
+    },
+    chain
   );
 
+  // Broadcast via RPC
+  const config = CHAIN_CONFIG[chain];
+  const response = await fetch(config.rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method: "eth_sendRawTransaction",
+      params: [signed.signedTx],
+      id: 1,
+    }),
+  });
+
+  const rpcResult = (await response.json()) as {
+    result?: string;
+    error?: { message: string; code?: number };
+  };
+
+  if (rpcResult.error) {
+    throw new Error(`Swap failed: ${rpcResult.error.message}`);
+  }
+
   return {
-    txHash: result.txHash,
+    txHash: rpcResult.result || "",
     status: "pending",
   };
 }
@@ -3195,6 +4356,7 @@ export function encodeAaveWithdraw(
 
 /**
  * Create a yield deposit plan for the best available opportunity
+ * Falls back to next-best option if the highest-APY adapter fails
  */
 export async function createYieldPlan(
   asset: string,
@@ -3206,63 +4368,88 @@ export async function createYieldPlan(
     throw new Error("Not authenticated");
   }
 
-  // Find best yield opportunity (now checks both Aave and Compound)
-  const best = await getBestYield(asset, preferredChains);
-  if (!best) {
+  // Get all opportunities sorted by APY
+  const opportunities = await getYieldOpportunities(asset, { chains: preferredChains });
+  if (opportunities.length === 0) {
     return null;
   }
 
+  // Try each opportunity until one works
+  for (const opp of opportunities) {
+    try {
+      const plan = await tryCreatePlanForOpportunity(opp, asset, amount, session.address);
+      if (plan) {
+        return plan;
+      }
+    } catch (error) {
+      console.error(`[clara] Skipping ${opp.protocol} on ${opp.chain}: ${error instanceof Error ? error.message : "unknown error"}`);
+      continue;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Try to create a plan for a specific opportunity
+ * Returns null if the adapter can't handle this opportunity
+ */
+async function tryCreatePlanForOpportunity(
+  opp: YieldOpportunity,
+  asset: string,
+  amount: string,
+  userAddress: string
+): Promise<YieldPlan | null> {
   // Get the protocol adapter
-  const adapter = getProtocolAdapter(best.protocol);
+  const adapter = getProtocolAdapter(opp.protocol);
   if (!adapter) {
-    console.error(`[clara] Unsupported protocol: ${best.protocol}`);
+    console.error(`[clara] Unsupported protocol: ${opp.protocol}`);
     return null;
   }
 
   // Verify chain is supported by this adapter
-  if (!adapter.supportedChains.includes(best.chain)) {
-    console.error(`[clara] ${adapter.displayName} not available on ${best.chain}`);
-    return null;
-  }
-
-  // Get pool address from adapter
-  const poolAddress = adapter.getPoolAddress(best.chain);
-  if (!poolAddress) {
-    console.error(`[clara] ${adapter.displayName} pool not configured for ${best.chain}`);
+  if (!adapter.supportedChains.includes(opp.chain)) {
+    console.error(`[clara] ${adapter.displayName} not available on ${opp.chain}`);
     return null;
   }
 
   // Get asset address on this chain
-  const tokenInfo = resolveToken(asset, best.chain);
+  const tokenInfo = resolveToken(asset, opp.chain);
   if (!tokenInfo) {
-    console.error(`[clara] Token ${asset} not found on ${best.chain}`);
+    console.error(`[clara] Token ${asset} not found on ${opp.chain}`);
     return null;
   }
 
-  // Check if approval is needed
-  const approval = await getAllowance(tokenInfo.address, poolAddress, best.chain);
-  const amountRaw = parseAmountToBigInt(amount, tokenInfo.decimals);
-  const needsApproval = BigInt(approval.allowanceRaw) < amountRaw;
-
   // Encode the supply transaction using the adapter
+  // Pass the pool symbol (e.g., "HYPERUSDC") for vault-based protocols like Morpho
   const encoded = adapter.encodeSupply({
     assetAddress: tokenInfo.address,
     amount,
     decimals: tokenInfo.decimals,
-    onBehalfOf: session.address,
-    chain: best.chain,
+    onBehalfOf: userAddress,
+    chain: opp.chain,
+    poolSymbol: opp.symbol, // DeFiLlama pool symbol for vault lookup
   });
+
+  // Use the target contract from encoded tx for approval check
+  // This ensures we check approval against the actual vault address
+  const poolAddress = encoded.to;
+
+  // Check if approval is needed
+  const approval = await getAllowance(tokenInfo.address, poolAddress, opp.chain);
+  const amountRaw = parseAmountToBigInt(amount, tokenInfo.decimals);
+  const needsApproval = BigInt(approval.allowanceRaw) < amountRaw;
 
   return {
     action: "deposit",
     protocol: adapter.displayName,
-    chain: best.chain,
+    chain: opp.chain,
     asset: tokenInfo.symbol,
     assetAddress: tokenInfo.address,
     amount,
     amountRaw: encoded.amountRaw,
-    apy: best.apyTotal,
-    tvlUsd: best.tvlUsd,
+    apy: opp.apyTotal,
+    tvlUsd: opp.tvlUsd,
     poolContract: encoded.to,
     transactionData: encoded.data,
     needsApproval,
@@ -3924,7 +5111,7 @@ async function getPortfolioData(address: string): Promise<{
   for (const chain of chains) {
     try {
       // Get native balance
-      const nativeBalance = await getNativeBalance(chain, address);
+      const nativeBalance = await getNativeBalance(chain);
       const nativeNum = parseFloat(nativeBalance.balance);
 
       // Get ETH price
@@ -4536,3 +5723,13 @@ export async function ensureGas(
     message: `Insufficient gas and no tokens available to swap. Add ${gasCheck.nativeSymbol} or stablecoins.`,
   };
 }
+
+// Re-export Solana module for direct access
+export {
+  getSolanaAssets,
+  getSolanaTransactions,
+  isHeliusAvailable,
+  type SolanaBalance,
+  type SolanaPortfolio,
+  type SolanaTransaction,
+} from "./solana.js";

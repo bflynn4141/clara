@@ -13,7 +13,10 @@ export function registerBalanceTool(server: McpServer) {
   server.registerTool(
     "wallet_get_balance",
     {
-      description: "Get token balances for your wallet on a specific chain. Shows native token and major stablecoins.",
+      description: `Get token balances for your wallet on a specific chain.
+
+EVM chains: Shows native token (ETH/MATIC) and major stablecoins (USDC, USDT, DAI).
+Solana: Shows SOL and all SPL tokens with USD values (requires HELIUS_API_KEY for full token list).`,
       inputSchema: {
         chain: z.enum(SUPPORTED_CHAINS)
           .default("base")
