@@ -22,8 +22,19 @@ import {
   getTokenMetadata,
   encodeERC20Transfer,
   getTokenBalance,
+  getBalances,
   type SupportedChain,
 } from "../para/client.js";
+import {
+  isValidEvmAddress,
+  isValidRecipient,
+  recipientError,
+  parseAndValidateAmount,
+  amountError,
+  gasGuidance,
+  zodRecipient,
+  zodAmount,
+} from "../utils/validators.js";
 
 const SUPPORTED_CHAINS = ["ethereum", "base", "arbitrum", "optimism", "polygon", "solana"] as const;
 
@@ -43,8 +54,8 @@ Or provide any ERC-20 token contract address.
 
 REQUIRES USER APPROVAL.`,
       inputSchema: {
-        to: z.string().describe("Recipient address or ENS name (e.g., '0x...' or 'vitalik.eth')"),
-        amount: z.string().describe("Amount to send in human units (e.g., '100' for 100 USDC)"),
+        to: zodRecipient,
+        amount: zodAmount,
         chain: z.enum(SUPPORTED_CHAINS).describe("Blockchain to send on"),
         token: z.string().optional().describe("Token symbol (USDC, USDT, DAI, WETH, WBTC) or contract address. Omit for native token."),
       },
@@ -59,9 +70,51 @@ REQUIRES USER APPROVAL.`,
           return {
             content: [{
               type: "text" as const,
-              text: `❌ No wallet configured. Run wallet_setup first.`
+              text: `❌ No wallet configured.\n\n` +
+                `Run \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.`
             }]
           };
+        }
+
+        // ── Input validation (before any API calls) ──
+
+        // Validate recipient format
+        if (!isValidRecipient(to)) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: recipientError(to)
+            }]
+          };
+        }
+
+        // Validate amount is a positive number
+        const amountCheck = parseAndValidateAmount(amount);
+        if (!amountCheck.valid) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `❌ Invalid amount: ${amountCheck.error}\n\nExample: amount="0.1" to send 0.1 ETH`
+            }]
+          };
+        }
+
+        // Check gas balance on EVM chains (catch the "why can't I send?" confusion)
+        if (chain !== "solana") {
+          try {
+            const balances = await getBalances(chain as SupportedChain);
+            const nativeBalance = parseFloat(balances[0]?.balance || "0");
+            if (nativeBalance === 0) {
+              return {
+                content: [{
+                  type: "text" as const,
+                  text: gasGuidance(chain)
+                }]
+              };
+            }
+          } catch {
+            // Don't block on gas check failure — let the send attempt proceed
+          }
         }
 
         // Resolve ENS name if applicable (only for EVM chains)
@@ -159,10 +212,26 @@ REQUIRES USER APPROVAL.`,
 
       } catch (error) {
         console.error("wallet_send error:", error);
+        const msg = error instanceof Error ? error.message : "Unknown error";
+
+        // Detect common failure patterns and add guidance
+        const isGasError = /insufficient funds|gas required|intrinsic gas/i.test(msg);
+        const isNonceError = /nonce/i.test(msg);
+        const isNetworkError = /ECONNREFUSED|ETIMEDOUT|fetch failed/i.test(msg);
+
+        let guidance = "";
+        if (isGasError) {
+          guidance = `\n\n${gasGuidance(chain)}`;
+        } else if (isNonceError) {
+          guidance = "\n\nThis usually resolves itself. Wait a moment and try again.";
+        } else if (isNetworkError) {
+          guidance = "\n\nNetwork connection issue. Check your internet and try again in a moment.";
+        }
+
         return {
           content: [{
             type: "text" as const,
-            text: `❌ Error: ${error instanceof Error ? error.message : "Unknown error"}`
+            text: `❌ Send failed: ${msg}${guidance}`
           }]
         };
       }

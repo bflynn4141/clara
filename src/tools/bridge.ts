@@ -16,12 +16,12 @@ import {
   encodeApproveCalldata,
   getTokenMetadata,
   sendTransaction,
-  getTokenBalance,
   getBalances,
-  resolveToken,
   type SupportedChain,
   type BridgeQuote,
 } from "../para/client.js";
+import { parseAndValidateAmount, zodAmount, zodToken, gasGuidance } from "../utils/validators.js";
+import { checkBalance } from "../utils/balance.js";
 
 const SUPPORTED_CHAINS = ["ethereum", "base", "arbitrum", "optimism", "polygon"] as const;
 
@@ -103,9 +103,9 @@ Uses Li.Fi to find the best route across Stargate, Across, Hop, and other bridge
 Supported chains: Ethereum, Base, Arbitrum, Optimism, Polygon
 Supported tokens: ETH, USDC, USDT, DAI, WETH, WBTC (or any contract address)`,
       inputSchema: {
-        fromToken: z.string().describe("Token to send (symbol like ETH/USDC or contract address)"),
-        toToken: z.string().describe("Token to receive (can be same or different from fromToken)"),
-        amount: z.string().describe("Amount of fromToken to bridge"),
+        fromToken: zodToken.describe("Token to send (symbol like ETH/USDC or contract address)"),
+        toToken: zodToken.describe("Token to receive (can be same or different from fromToken)"),
+        amount: zodAmount.describe("Amount of fromToken to bridge"),
         fromChain: z.enum(SUPPORTED_CHAINS).describe("Source blockchain"),
         toChain: z.enum(SUPPORTED_CHAINS).describe("Destination blockchain"),
         action: z.enum(["quote", "execute"]).optional().default("quote").describe("quote = preview only, execute = perform the bridge"),
@@ -122,7 +122,18 @@ Supported tokens: ETH, USDC, USDT, DAI, WETH, WBTC (or any contract address)`,
             content: [{
               type: "text" as const,
               text: `❌ Source and destination chains are the same (${fromChain}).\n\n` +
-                `For same-chain swaps, use wallet_swap instead.`
+                `For same-chain swaps, use \`wallet_swap\` instead.`
+            }]
+          };
+        }
+
+        // Validate amount before any API calls
+        const amountCheck = parseAndValidateAmount(amount);
+        if (!amountCheck.valid) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `❌ Invalid amount: ${amountCheck.error}\n\nExample: amount="0.1" to bridge 0.1 ETH`
             }]
           };
         }
@@ -133,7 +144,8 @@ Supported tokens: ETH, USDC, USDT, DAI, WETH, WBTC (or any contract address)`,
           return {
             content: [{
               type: "text" as const,
-              text: `❌ No wallet configured. Run wallet_setup first.`
+              text: `❌ No wallet configured.\n\n` +
+                `Run \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.`
             }]
           };
         }
@@ -240,10 +252,22 @@ Supported tokens: ETH, USDC, USDT, DAI, WETH, WBTC (or any contract address)`,
 
       } catch (error) {
         console.error("wallet_bridge error:", error);
+        const msg = error instanceof Error ? error.message : "Unknown error";
+
+        const isGasError = /insufficient funds|gas required|intrinsic gas/i.test(msg);
+        const isRouteError = /no route|no quotes|route not found/i.test(msg);
+
+        let guidance = "";
+        if (isGasError) {
+          guidance = `\n\n${gasGuidance(fromChain)}`;
+        } else if (isRouteError) {
+          guidance = "\n\nNo bridge route found for this pair. Try a different token or a more common route (e.g., ETH or USDC between major chains).";
+        }
+
         return {
           content: [{
             type: "text" as const,
-            text: `❌ Bridge failed: ${error instanceof Error ? error.message : "Unknown error"}`
+            text: `❌ Bridge failed: ${msg}${guidance}`
           }]
         };
       }
@@ -251,53 +275,7 @@ Supported tokens: ETH, USDC, USDT, DAI, WETH, WBTC (or any contract address)`,
   );
 }
 
-/**
- * Check if user has sufficient balance for the bridge
- */
-async function checkBalance(
-  token: string,
-  amount: string,
-  chain: SupportedChain,
-  address: string
-): Promise<{ sufficient: boolean; balance: string }> {
-  const amountNum = parseFloat(amount);
-
-  // Check native token balance
-  const nativeSymbols = ["ETH", "MATIC", "NATIVE"];
-  if (nativeSymbols.includes(token.toUpperCase())) {
-    const balances = await getBalances(chain);
-    const balance = parseFloat(balances[0]?.balance || "0");
-    return {
-      sufficient: balance >= amountNum,
-      balance: balances[0]?.balance || "0",
-    };
-  }
-
-  // Check ERC-20 token balance
-  try {
-    let tokenAddress: string;
-    if (token.startsWith("0x")) {
-      tokenAddress = token;
-    } else {
-      // Use resolveToken to properly convert symbol to address
-      const resolved = resolveToken(token, chain);
-      if (!resolved) {
-        // Token not supported on this chain
-        return { sufficient: false, balance: "0" };
-      }
-      tokenAddress = resolved.address;
-    }
-
-    const tokenBalance = await getTokenBalance(tokenAddress, chain, address);
-    const balance = parseFloat(tokenBalance.balance);
-    return {
-      sufficient: balance >= amountNum,
-      balance: tokenBalance.balance,
-    };
-  } catch {
-    return { sufficient: false, balance: "0" };
-  }
-}
+// checkBalance extracted to ../utils/balance.ts
 
 /**
  * Format a bridge quote for display

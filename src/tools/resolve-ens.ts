@@ -5,6 +5,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { resolveEnsName, reverseResolveEns, isEnsName } from "../para/client.js";
+import { isValidEvmAddress } from "../utils/validators.js";
 
 export function registerResolveEnsTool(server: McpServer) {
   server.registerTool(
@@ -30,7 +31,7 @@ export function registerResolveEnsTool(server: McpServer) {
 
       try {
         // Determine if this is a forward or reverse lookup
-        const isAddress = input.startsWith("0x") && input.length === 42;
+        const isAddress = isValidEvmAddress(input);
 
         if (isAddress) {
           // Reverse lookup: address -> ENS name
@@ -57,6 +58,23 @@ export function registerResolveEnsTool(server: McpServer) {
               }]
             };
           }
+        }
+
+        // Catch malformed addresses: starts with 0x but isn't valid
+        if (input.startsWith("0x") && !isAddress) {
+          const hexPart = input.slice(2);
+          const issues: string[] = [];
+          if (hexPart.length !== 40) issues.push(`has ${input.length} characters (expected 42)`);
+          if (!/^[0-9a-fA-F]*$/.test(hexPart)) issues.push("contains non-hex characters");
+          return {
+            content: [{
+              type: "text" as const,
+              text: `❌ Invalid Ethereum address: "${input}"\n\n` +
+                `Issues: ${issues.join(", ")}\n\n` +
+                `Ethereum addresses are 42 characters: 0x followed by 40 hex digits (0-9, a-f).\n` +
+                `Example: 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045`
+            }]
+          };
         }
 
         // Forward lookup: ENS name -> address

@@ -16,18 +16,17 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getSession } from "../storage/session.js";
 import {
-  getSwapQuote,
   getSwapQuoteBest,
   executeSwap,
   encodeApproveCalldata,
   getTokenMetadata,
   sendTransaction,
-  getTokenBalance,
   getBalances,
-  resolveToken,
   type SupportedChain,
   type SwapQuote,
 } from "../para/client.js";
+import { parseAndValidateAmount, zodAmount, zodToken, gasGuidance } from "../utils/validators.js";
+import { checkBalance } from "../utils/balance.js";
 
 const SUPPORTED_CHAINS = ["ethereum", "base", "arbitrum", "optimism", "polygon"] as const;
 
@@ -53,9 +52,9 @@ Finds the best price across Uniswap, Sushiswap, Curve, and other DEXs.
 
 Supported tokens: ETH, MATIC, USDC, USDT, DAI, WETH, WBTC (or any contract address)`,
       inputSchema: {
-        fromToken: z.string().describe("Token to sell (symbol like ETH/USDC or contract address)"),
-        toToken: z.string().describe("Token to buy (symbol like ETH/USDC or contract address)"),
-        amount: z.string().describe("Amount of fromToken to swap"),
+        fromToken: zodToken.describe("Token to sell (symbol like ETH/USDC or contract address)"),
+        toToken: zodToken.describe("Token to buy (symbol like ETH/USDC or contract address)"),
+        amount: zodAmount.describe("Amount of fromToken to swap"),
         chain: z.enum(SUPPORTED_CHAINS).describe("Blockchain to swap on"),
         action: z.enum(["quote", "execute"]).optional().default("quote").describe("quote = preview only, execute = perform the swap"),
         slippage: z.number().optional().default(0.5).describe("Max slippage percentage (default 0.5%)"),
@@ -71,9 +70,49 @@ Supported tokens: ETH, MATIC, USDC, USDT, DAI, WETH, WBTC (or any contract addre
           return {
             content: [{
               type: "text" as const,
-              text: `❌ No wallet configured. Run wallet_setup first.`
+              text: `❌ No wallet configured.\n\n` +
+                `Run \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.`
             }]
           };
+        }
+
+        // ── Input validation (before any API calls) ──
+
+        const amountCheck = parseAndValidateAmount(amount);
+        if (!amountCheck.valid) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `❌ Invalid amount: ${amountCheck.error}\n\nExample: amount="0.1" to swap 0.1 ETH`
+            }]
+          };
+        }
+
+        if (fromToken.toUpperCase() === toToken.toUpperCase()) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `❌ Cannot swap ${fromToken.toUpperCase()} to itself.\n\n` +
+                `Did you mean to bridge to another chain? Try:\n` +
+                `  \`wallet_bridge fromToken="${fromToken}" toToken="${toToken}" fromChain="${chain}" toChain="..."\``
+            }]
+          };
+        }
+
+        // Check gas balance (the "why does nothing work?" issue for newbies)
+        try {
+          const balances = await getBalances(chain as SupportedChain);
+          const nativeBalance = parseFloat(balances[0]?.balance || "0");
+          if (nativeBalance === 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: gasGuidance(chain)
+              }]
+            };
+          }
+        } catch {
+          // Don't block on gas check failure
         }
 
         // Check balance first
@@ -156,10 +195,22 @@ Supported tokens: ETH, MATIC, USDC, USDT, DAI, WETH, WBTC (or any contract addre
 
       } catch (error) {
         console.error("wallet_swap error:", error);
+        const msg = error instanceof Error ? error.message : "Unknown error";
+
+        const isGasError = /insufficient funds|gas required|intrinsic gas/i.test(msg);
+        const isLiquidityError = /no route|liquidity|no quotes/i.test(msg);
+
+        let guidance = "";
+        if (isGasError) {
+          guidance = `\n\n${gasGuidance(chain)}`;
+        } else if (isLiquidityError) {
+          guidance = "\n\nNot enough liquidity for this swap. Try a smaller amount or a different token pair.";
+        }
+
         return {
           content: [{
             type: "text" as const,
-            text: `❌ Swap failed: ${error instanceof Error ? error.message : "Unknown error"}`
+            text: `❌ Swap failed: ${msg}${guidance}`
           }]
         };
       }
@@ -167,53 +218,7 @@ Supported tokens: ETH, MATIC, USDC, USDT, DAI, WETH, WBTC (or any contract addre
   );
 }
 
-/**
- * Check if user has sufficient balance for the swap
- */
-async function checkBalance(
-  token: string,
-  amount: string,
-  chain: SupportedChain,
-  address: string
-): Promise<{ sufficient: boolean; balance: string }> {
-  const amountNum = parseFloat(amount);
-
-  // Check native token balance
-  const nativeSymbols = ["ETH", "MATIC", "NATIVE"];
-  if (nativeSymbols.includes(token.toUpperCase())) {
-    const balances = await getBalances(chain);
-    const balance = parseFloat(balances[0]?.balance || "0");
-    return {
-      sufficient: balance >= amountNum,
-      balance: balances[0]?.balance || "0",
-    };
-  }
-
-  // Check ERC-20 token balance
-  try {
-    let tokenAddress: string;
-    if (token.startsWith("0x")) {
-      tokenAddress = token;
-    } else {
-      // Use resolveToken to properly convert symbol to address
-      const resolved = resolveToken(token, chain);
-      if (!resolved) {
-        // Token not supported on this chain
-        return { sufficient: false, balance: "0" };
-      }
-      tokenAddress = resolved.address;
-    }
-
-    const tokenBalance = await getTokenBalance(tokenAddress, chain, address);
-    const balance = parseFloat(tokenBalance.balance);
-    return {
-      sufficient: balance >= amountNum,
-      balance: tokenBalance.balance,
-    };
-  } catch {
-    return { sufficient: false, balance: "0" };
-  }
-}
+// checkBalance extracted to ../utils/balance.ts
 
 /**
  * Format a swap quote for display

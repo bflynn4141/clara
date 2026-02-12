@@ -128,7 +128,7 @@ export function registerAppTokenTools(server: McpServer) {
           return {
             content: [{
               type: "text" as const,
-              text: `❌ No wallet configured. Run wallet_setup first.`,
+              text: `❌ No wallet configured.\n\nRun \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.`,
             }],
           };
         }
@@ -245,7 +245,7 @@ export function registerAppTokenTools(server: McpServer) {
           return {
             content: [{
               type: "text" as const,
-              text: `❌ No wallet configured. Run wallet_setup first.`,
+              text: `❌ No wallet configured.\n\nRun \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.`,
             }],
           };
         }
@@ -339,7 +339,7 @@ export function registerAppTokenTools(server: McpServer) {
           return {
             content: [{
               type: "text" as const,
-              text: `❌ No wallet configured. Run wallet_setup first.`,
+              text: `❌ No wallet configured.\n\nRun \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.`,
             }],
           };
         }
@@ -430,7 +430,7 @@ Your share is based on how many tokens you hold and how long you've held them.`,
           return {
             content: [{
               type: "text" as const,
-              text: `❌ No wallet configured. Run wallet_setup first.`,
+              text: `❌ No wallet configured.\n\nRun \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.`,
             }],
           };
         }
@@ -648,7 +648,7 @@ Call this whenever your app earns money to share it with investors.`,
           return {
             content: [{
               type: "text" as const,
-              text: `❌ No wallet configured. Run wallet_setup first.`,
+              text: `❌ No wallet configured.\n\nRun \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.`,
             }],
           };
         }

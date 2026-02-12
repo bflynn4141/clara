@@ -166,7 +166,7 @@ Supported: USDC, USDT, DAI on Base and Arbitrum (Aave v3, Compound v3)`,
 
         if (!session?.authenticated || !session.address) {
           return {
-            content: [{ type: "text" as const, text: `❌ No wallet configured. Run wallet_setup first.` }]
+            content: [{ type: "text" as const, text: `❌ No wallet configured.\n\nRun \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.` }]
           };
         }
 
@@ -1080,7 +1080,7 @@ async function showTransactionHistory(
     const session = await getSession();
 
     if (!session?.address) {
-      return { content: [{ type: "text" as const, text: `❌ No wallet configured. Run wallet_setup first.` }] };
+      return { content: [{ type: "text" as const, text: `❌ No wallet configured.\n\nRun \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.` }] };
     }
 
     const history = await loadYieldHistory(session.address);

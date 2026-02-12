@@ -50,7 +50,7 @@ export function registerPortfolioTool(server: McpServer) {
           return {
             content: [{
               type: "text" as const,
-              text: `❌ No wallet configured. Run wallet_setup first.`
+              text: `❌ No wallet configured.\n\nRun \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.`
             }]
           };
         }
