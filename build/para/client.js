@@ -11,6 +11,10 @@
  */
 import { getSession, updateSession } from "../storage/session.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
+import { recordYieldTransaction, getTransactionsForPosition, calculateEarnings, getYieldEarningsSummary, } from "../storage/yield-history.js";
+import { getProtocolAdapter, getSupportedProtocols, } from "./protocols/index.js";
+import { getTransactionHistoryZerion, isZerionAvailable, getPortfolioZerion, } from "./zerion.js";
+import { getSolanaAssets, } from "./solana.js";
 // Chain configurations
 const CHAIN_CONFIG = {
     ethereum: { name: "Ethereum", chainId: 1, rpcUrl: "https://eth.llamarpc.com" },
@@ -48,6 +52,256 @@ const EXPLORER_CONFIG = {
 // Default: Uses Clara proxy which injects API key
 // Override with PARA_API_URL env var for direct API access with your own key
 const PARA_API_BASE = process.env.PARA_API_URL || "https://clara-proxy.bflynn-me.workers.dev/api";
+// ============================================
+// RLP Encoding for EIP-1559 Transactions
+// ============================================
+/**
+ * Encode a single item for RLP
+ * - Bytes 0-55: 0x80 + length prefix
+ * - Bytes > 55: 0xb7 + length-of-length prefix
+ */
+function rlpEncodeBytes(data) {
+    if (data.length === 1 && data[0] < 0x80) {
+        return data;
+    }
+    if (data.length <= 55) {
+        const result = new Uint8Array(1 + data.length);
+        result[0] = 0x80 + data.length;
+        result.set(data, 1);
+        return result;
+    }
+    const lengthBytes = bigIntToBytes(BigInt(data.length));
+    const result = new Uint8Array(1 + lengthBytes.length + data.length);
+    result[0] = 0xb7 + lengthBytes.length;
+    result.set(lengthBytes, 1);
+    result.set(data, 1 + lengthBytes.length);
+    return result;
+}
+/**
+ * Convert BigInt to minimal bytes (big-endian, no leading zeros)
+ */
+function bigIntToBytes(value) {
+    if (value === 0n)
+        return new Uint8Array(0);
+    let hex = value.toString(16);
+    if (hex.length % 2)
+        hex = "0" + hex;
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+        bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    }
+    return bytes;
+}
+/**
+ * Convert hex string to Uint8Array
+ */
+function hexToBytes(hex) {
+    const cleanHex = hex.startsWith("0x") ? hex.slice(2) : hex;
+    if (cleanHex.length === 0)
+        return new Uint8Array(0);
+    const padded = cleanHex.length % 2 ? "0" + cleanHex : cleanHex;
+    const bytes = new Uint8Array(padded.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+        bytes[i] = parseInt(padded.slice(i * 2, i * 2 + 2), 16);
+    }
+    return bytes;
+}
+/**
+ * Convert Uint8Array to hex string with 0x prefix
+ */
+function bytesToHex(bytes) {
+    return "0x" + Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+/**
+ * Encode an EIP-1559 (type 2) unsigned transaction for signing
+ * Returns: 0x02 || RLP([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList])
+ */
+function encodeUnsignedEIP1559Tx(tx) {
+    // Encode each field individually
+    const encodedFields = [
+        rlpEncodeBytes(bigIntToBytes(BigInt(tx.chainId))),
+        rlpEncodeBytes(bigIntToBytes(BigInt(tx.nonce))),
+        rlpEncodeBytes(bigIntToBytes(tx.maxPriorityFeePerGas)),
+        rlpEncodeBytes(bigIntToBytes(tx.maxFeePerGas)),
+        rlpEncodeBytes(bigIntToBytes(tx.gasLimit)),
+        rlpEncodeBytes(hexToBytes(tx.to)),
+        rlpEncodeBytes(bigIntToBytes(tx.value)),
+        rlpEncodeBytes(hexToBytes(tx.data)),
+        new Uint8Array([0xc0]), // Empty access list = RLP empty list
+    ];
+    // Calculate total length of encoded fields
+    const totalLength = encodedFields.reduce((sum, f) => sum + f.length, 0);
+    // Encode as RLP list
+    let rlpEncoded;
+    if (totalLength <= 55) {
+        rlpEncoded = new Uint8Array(1 + totalLength);
+        rlpEncoded[0] = 0xc0 + totalLength;
+        let offset = 1;
+        for (const field of encodedFields) {
+            rlpEncoded.set(field, offset);
+            offset += field.length;
+        }
+    }
+    else {
+        const lengthBytes = bigIntToBytes(BigInt(totalLength));
+        rlpEncoded = new Uint8Array(1 + lengthBytes.length + totalLength);
+        rlpEncoded[0] = 0xf7 + lengthBytes.length;
+        rlpEncoded.set(lengthBytes, 1);
+        let offset = 1 + lengthBytes.length;
+        for (const field of encodedFields) {
+            rlpEncoded.set(field, offset);
+            offset += field.length;
+        }
+    }
+    // Prepend type byte (0x02 for EIP-1559)
+    const result = new Uint8Array(1 + rlpEncoded.length);
+    result[0] = 0x02;
+    result.set(rlpEncoded, 1);
+    return result;
+}
+/**
+ * Encode a signed EIP-1559 transaction for broadcast
+ * Returns: 0x02 || RLP([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, v, r, s])
+ */
+function encodeSignedEIP1559Tx(tx) {
+    // Encode each field individually
+    const encodedFields = [
+        rlpEncodeBytes(bigIntToBytes(BigInt(tx.chainId))),
+        rlpEncodeBytes(bigIntToBytes(BigInt(tx.nonce))),
+        rlpEncodeBytes(bigIntToBytes(tx.maxPriorityFeePerGas)),
+        rlpEncodeBytes(bigIntToBytes(tx.maxFeePerGas)),
+        rlpEncodeBytes(bigIntToBytes(tx.gasLimit)),
+        rlpEncodeBytes(hexToBytes(tx.to)),
+        rlpEncodeBytes(bigIntToBytes(tx.value)),
+        rlpEncodeBytes(hexToBytes(tx.data)),
+        new Uint8Array([0xc0]), // Empty access list = RLP empty list
+        rlpEncodeBytes(bigIntToBytes(BigInt(tx.v))),
+        rlpEncodeBytes(bigIntToBytes(tx.r)),
+        rlpEncodeBytes(bigIntToBytes(tx.s)),
+    ];
+    // Calculate total length
+    const totalLength = encodedFields.reduce((sum, f) => sum + f.length, 0);
+    // Encode as RLP list
+    let rlpEncoded;
+    if (totalLength <= 55) {
+        rlpEncoded = new Uint8Array(1 + totalLength);
+        rlpEncoded[0] = 0xc0 + totalLength;
+        let offset = 1;
+        for (const field of encodedFields) {
+            rlpEncoded.set(field, offset);
+            offset += field.length;
+        }
+    }
+    else {
+        const lengthBytes = bigIntToBytes(BigInt(totalLength));
+        rlpEncoded = new Uint8Array(1 + lengthBytes.length + totalLength);
+        rlpEncoded[0] = 0xf7 + lengthBytes.length;
+        rlpEncoded.set(lengthBytes, 1);
+        let offset = 1 + lengthBytes.length;
+        for (const field of encodedFields) {
+            rlpEncoded.set(field, offset);
+            offset += field.length;
+        }
+    }
+    // Prepend type byte (0x02 for EIP-1559)
+    const result = new Uint8Array(1 + rlpEncoded.length);
+    result[0] = 0x02;
+    result.set(rlpEncoded, 1);
+    return result;
+}
+/**
+ * Parse a 65-byte signature into r, s, v components
+ * Format: r (32 bytes) + s (32 bytes) + v (1 byte)
+ */
+function parseSignature(sig) {
+    const cleanSig = sig.startsWith("0x") ? sig.slice(2) : sig;
+    if (cleanSig.length !== 130) {
+        throw new Error(`Invalid signature length: expected 130 hex chars, got ${cleanSig.length}`);
+    }
+    const r = BigInt("0x" + cleanSig.slice(0, 64));
+    const s = BigInt("0x" + cleanSig.slice(64, 128));
+    let v = parseInt(cleanSig.slice(128, 130), 16);
+    // Normalize v: Para may return 27/28, but EIP-1559 uses 0/1
+    if (v >= 27)
+        v -= 27;
+    return { r, s, v };
+}
+/**
+ * Internal: Get the current nonce for an address
+ */
+async function fetchNonce(address, chain) {
+    const config = CHAIN_CONFIG[chain];
+    const response = await fetch(config.rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "eth_getTransactionCount",
+            params: [address, "pending"],
+            id: 1,
+        }),
+    });
+    const result = await response.json();
+    if (result.error) {
+        throw new Error(`Failed to get nonce: ${result.error.message}`);
+    }
+    return parseInt(result.result || "0x0", 16);
+}
+/**
+ * Internal: Estimate gas limit for a transaction
+ */
+async function fetchGasLimit(tx, chain) {
+    const config = CHAIN_CONFIG[chain];
+    const response = await fetch(config.rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "eth_estimateGas",
+            params: [{
+                    to: tx.to,
+                    from: tx.from,
+                    value: tx.value || "0x0",
+                    data: tx.data || "0x",
+                }],
+            id: 1,
+        }),
+    });
+    const result = await response.json();
+    if (result.error) {
+        // Default to 21000 for simple transfers, higher for contract calls
+        return tx.data && tx.data !== "0x" ? 100000n : 21000n;
+    }
+    // Add 20% buffer
+    return BigInt(result.result || "0x5208") * 120n / 100n;
+}
+/**
+ * Internal: Get current gas prices
+ */
+async function fetchGasPrices(chain) {
+    const config = CHAIN_CONFIG[chain];
+    // Get base fee from latest block
+    const blockResponse = await fetch(config.rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "eth_getBlockByNumber",
+            params: ["latest", false],
+            id: 1,
+        }),
+    });
+    const blockResult = await blockResponse.json();
+    const baseFee = BigInt(blockResult.result?.baseFeePerGas || "0x3b9aca00"); // Default 1 gwei
+    // Set priority fee (tip) - 0.1 gwei for L2s, 1 gwei for mainnet
+    const priorityFee = chain === "ethereum" ? 1000000000n : 100000000n;
+    // Max fee = 2 * base fee + priority fee (gives room for base fee increases)
+    const maxFee = baseFee * 2n + priorityFee;
+    return {
+        maxFeePerGas: maxFee,
+        maxPriorityFeePerGas: priorityFee,
+    };
+}
 // ENS Contract Addresses (Ethereum Mainnet)
 const ENS_REGISTRY = "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e";
 /**
@@ -232,9 +486,27 @@ async function paraFetch(endpoint, options = {}) {
         headers,
     });
     if (!response.ok) {
-        const error = await response.text();
-        console.error(`[clara] API error: ${response.status} - ${error}`);
-        throw new Error(`Para API error: ${response.status} - ${error}`);
+        const errorText = await response.text();
+        console.error(`[clara] API error: ${response.status} - ${errorText}`);
+        // For 409 Conflict, try to parse wallet info from response
+        if (response.status === 409) {
+            try {
+                const errorJson = JSON.parse(errorText);
+                // Some APIs return the existing resource on conflict
+                if (errorJson.wallet) {
+                    console.error(`[clara] 409 response contains wallet info: ${errorJson.wallet.id}`);
+                    // Create a fake "ok" response with the wallet data
+                    return new Response(JSON.stringify(errorJson), {
+                        status: 200,
+                        headers: { "Content-Type": "application/json" },
+                    });
+                }
+            }
+            catch {
+                // Not JSON or no wallet info, continue with error
+            }
+        }
+        throw new Error(`Para API error: ${response.status} - ${errorText}`);
     }
     return response;
 }
@@ -374,6 +646,55 @@ export async function completeWalletSetup(sessionId) {
     };
 }
 /**
+ * Repair a session that is missing walletId
+ * This can happen if the session was created with an older version
+ * or if there was a bug in the setup flow.
+ *
+ * Returns true if repair was successful, false otherwise.
+ */
+export async function repairMissingWalletId() {
+    const session = await getSession();
+    if (!session?.authenticated) {
+        console.error("[clara] Cannot repair: not authenticated");
+        return false;
+    }
+    if (session.walletId) {
+        console.error("[clara] Session already has walletId, no repair needed");
+        return true;
+    }
+    // Build identifier from session
+    const identifier = session.identifier
+        ? {
+            type: session.identifierType === 'email' ? 'email' : 'customId',
+            value: session.identifier,
+        }
+        : session.email
+            ? { type: 'email', value: session.email }
+            : null;
+    if (!identifier) {
+        console.error("[clara] Cannot repair: no identifier in session");
+        return false;
+    }
+    console.error(`[clara] Repairing session - fetching walletId for ${identifier.type}: ${identifier.value}`);
+    try {
+        const wallets = await fetchWalletsForIdentifier(identifier);
+        if (wallets.evm) {
+            await updateSession({
+                walletId: wallets.evm.id,
+                solanaWalletId: wallets.solana?.id,
+            });
+            console.error(`[clara] Repair successful - walletId: ${wallets.evm.id}`);
+            return true;
+        }
+        console.error("[clara] Repair failed: no EVM wallet found for identifier");
+        return false;
+    }
+    catch (error) {
+        console.error("[clara] Repair failed:", error);
+        return false;
+    }
+}
+/**
  * Get wallet address for a specific chain
  */
 export async function getWalletAddress(chain) {
@@ -390,64 +711,51 @@ export async function getWalletAddress(chain) {
     return session.address;
 }
 /**
- * Get token balances for a chain
+ * Get token balances for a chain (legacy - native token only)
  */
 export async function getBalances(chain, _tokenAddress) {
     const session = await getSession();
     if (!session?.authenticated || !session.address) {
         throw new Error("Not authenticated");
     }
-    const config = CHAIN_CONFIG[chain];
     console.error(`[clara] Fetching balances for ${chain}`);
     try {
         if (chain === "solana") {
-            const solAddress = await getWalletAddress("solana").catch(() => null);
-            if (!solAddress) {
-                return [{ symbol: "SOL", balance: "0.0", usdValue: "N/A" }];
-            }
-            const response = await fetch(config.rpcUrl, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    jsonrpc: "2.0",
-                    id: 1,
-                    method: "getBalance",
-                    params: [solAddress],
-                }),
-            });
-            const data = (await response.json());
-            const lamports = data.result?.value || 0;
-            const solBalance = lamports / 1e9;
-            return [
-                {
+            // Use Helius-powered Solana client for rich data (USD prices, SPL tokens)
+            try {
+                const portfolio = await getSolanaAssets();
+                const balances = [];
+                // Add native SOL
+                balances.push({
                     symbol: "SOL",
-                    balance: solBalance.toFixed(6),
-                    usdValue: undefined,
-                },
-            ];
+                    balance: portfolio.nativeBalance.balance,
+                    usdValue: portfolio.nativeBalance.valueUsd?.toFixed(2),
+                });
+                // Add SPL tokens
+                for (const token of portfolio.tokens) {
+                    balances.push({
+                        symbol: token.symbol,
+                        balance: token.balance,
+                        usdValue: token.valueUsd?.toFixed(2),
+                        contractAddress: token.mintAddress,
+                    });
+                }
+                return balances;
+            }
+            catch (error) {
+                console.error("[clara] Solana balance fetch failed:", error);
+                return [{ symbol: "SOL", balance: "0.0", usdValue: undefined }];
+            }
         }
-        // EVM balance check via RPC
-        const response = await fetch(config.rpcUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                jsonrpc: "2.0",
-                method: "eth_getBalance",
-                params: [session.address, "latest"],
-                id: 1,
-            }),
-        });
-        const data = (await response.json());
-        const balanceWei = BigInt(data.result || "0");
-        const balanceEth = Number(balanceWei) / 1e18;
-        const symbol = chain === "polygon" ? "MATIC" : "ETH";
-        return [
-            {
-                symbol,
-                balance: balanceEth.toFixed(6),
-                usdValue: undefined,
-            },
-        ];
+        // EVM chains: Use Multicall3 to fetch native + all ERC-20 tokens in one call
+        const multiBalances = await getAllBalancesMulticall(chain);
+        // Convert MultiTokenBalance[] to TokenBalance[]
+        return multiBalances.map(b => ({
+            symbol: b.symbol,
+            balance: b.balance,
+            usdValue: b.usdValue?.toString(),
+            contractAddress: b.contractAddress,
+        }));
     }
     catch (error) {
         console.error(`[clara] Balance fetch error:`, error);
@@ -458,6 +766,351 @@ export async function getBalances(chain, _tokenAddress) {
             },
         ];
     }
+}
+// ============================================================================
+// Multicall3 - Efficient Batch Balance Fetching
+// ============================================================================
+/**
+ * Multicall3 contract address (same on all EVM chains)
+ * https://www.multicall3.com/
+ */
+const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
+/**
+ * Multicall3 function selectors
+ */
+const MULTICALL3_SELECTORS = {
+    // aggregate3(Call3[]) - returns Result[]
+    aggregate3: "0x82ad56cb",
+    // getEthBalance(address) - returns uint256
+    getEthBalance: "0x4d2301cc",
+};
+/**
+ * Fetch ALL token balances for a chain in a single RPC call using Multicall3
+ *
+ * This is much more efficient than making separate calls for each token:
+ * - Before: 1 call per token (5+ RPC calls)
+ * - After: 1 RPC call total (via Multicall3 batching)
+ */
+export async function getAllBalancesMulticall(chain) {
+    const session = await getSession();
+    if (!session?.authenticated || !session.address) {
+        throw new Error("Not authenticated");
+    }
+    if (chain === "solana") {
+        // Solana doesn't have Multicall3 - use legacy method
+        const balances = await getBalances("solana");
+        return balances.map(b => ({
+            symbol: b.symbol,
+            balance: b.balance,
+            balanceRaw: "0",
+            decimals: 9,
+        }));
+    }
+    const config = CHAIN_CONFIG[chain];
+    const userAddress = session.address.slice(2).toLowerCase().padStart(64, "0");
+    console.error(`[clara] Fetching all balances for ${chain} via Multicall3`);
+    // Build the list of tokens to check
+    const tokensToCheck = [];
+    for (const [symbol, chainData] of Object.entries(POPULAR_TOKENS)) {
+        const tokenInfo = chainData[chain];
+        if (tokenInfo) {
+            tokensToCheck.push({
+                symbol,
+                address: tokenInfo.address,
+                decimals: tokenInfo.decimals,
+            });
+        }
+    }
+    // Build Multicall3 calls array
+    // Each call: { target, allowFailure, callData }
+    // We encode this as: target (address) + allowFailure (bool) + callData (bytes)
+    const calls = [];
+    // First call: get native ETH balance via Multicall3.getEthBalance(address)
+    calls.push({
+        target: MULTICALL3_ADDRESS,
+        allowFailure: true,
+        callData: MULTICALL3_SELECTORS.getEthBalance + userAddress,
+    });
+    // Add balanceOf calls for each token
+    for (const token of tokensToCheck) {
+        calls.push({
+            target: token.address,
+            allowFailure: true,
+            callData: ERC20_SELECTORS.balanceOf + userAddress,
+        });
+    }
+    // Encode aggregate3 call
+    // aggregate3(Call3[] calldata calls)
+    // Call3 = (address target, bool allowFailure, bytes callData)
+    const encodedCalls = encodeMulticallAggregate3(calls);
+    try {
+        const response = await fetch(config.rpcUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                jsonrpc: "2.0",
+                method: "eth_call",
+                params: [
+                    {
+                        to: MULTICALL3_ADDRESS,
+                        data: encodedCalls,
+                    },
+                    "latest",
+                ],
+                id: 1,
+            }),
+        });
+        const rpcResult = (await response.json());
+        if (rpcResult.error || !rpcResult.result) {
+            console.error(`[clara] Multicall3 failed:`, rpcResult.error);
+            // Fallback to individual calls
+            return await getAllBalancesFallback(chain, tokensToCheck);
+        }
+        // Decode the results
+        const results = decodeMulticallResults(rpcResult.result, calls.length);
+        const balances = [];
+        // First result is native ETH balance
+        const nativeSymbol = chain === "polygon" ? "MATIC" : "ETH";
+        if (results[0].success && results[0].data.length >= 66) {
+            const balanceRaw = BigInt(results[0].data);
+            const balance = Number(balanceRaw) / 1e18;
+            if (balance > 0) {
+                balances.push({
+                    symbol: nativeSymbol,
+                    balance: balance.toFixed(6),
+                    balanceRaw: balanceRaw.toString(),
+                    decimals: 18,
+                });
+            }
+        }
+        // Rest are token balances
+        for (let i = 0; i < tokensToCheck.length; i++) {
+            const result = results[i + 1]; // +1 because first is native
+            const token = tokensToCheck[i];
+            if (result.success && result.data.length >= 66) {
+                const balanceRaw = BigInt(result.data);
+                const balance = Number(balanceRaw) / Math.pow(10, token.decimals);
+                if (balance > 0) {
+                    balances.push({
+                        symbol: token.symbol,
+                        balance: balance.toFixed(token.decimals > 6 ? 6 : token.decimals),
+                        balanceRaw: balanceRaw.toString(),
+                        decimals: token.decimals,
+                        contractAddress: token.address,
+                    });
+                }
+            }
+        }
+        console.error(`[clara] Found ${balances.length} non-zero balances on ${chain}`);
+        return balances;
+    }
+    catch (error) {
+        console.error(`[clara] Multicall3 error:`, error);
+        return await getAllBalancesFallback(chain, tokensToCheck);
+    }
+}
+/**
+ * Encode aggregate3 call data for Multicall3
+ */
+function encodeMulticallAggregate3(calls) {
+    // aggregate3(Call3[] calldata calls)
+    // Call3 = (address target, bool allowFailure, bytes callData)
+    // Function selector
+    let encoded = MULTICALL3_SELECTORS.aggregate3;
+    // Offset to array data (32 bytes)
+    encoded += "0000000000000000000000000000000000000000000000000000000000000020";
+    // Array length
+    encoded += calls.length.toString(16).padStart(64, "0");
+    // Calculate offsets for each call's dynamic data
+    // Each Call3 has: address (32) + bool (32) + bytes offset (32) = 96 bytes fixed
+    // Plus variable bytes data
+    let dataOffset = calls.length * 96; // Starting offset for bytes data
+    const dynamicParts = [];
+    for (const call of calls) {
+        // target address (padded to 32 bytes)
+        encoded += call.target.slice(2).toLowerCase().padStart(64, "0");
+        // allowFailure bool
+        encoded += call.allowFailure ? "0000000000000000000000000000000000000000000000000000000000000001" : "0000000000000000000000000000000000000000000000000000000000000000";
+        // Offset to callData
+        encoded += dataOffset.toString(16).padStart(64, "0");
+        // Calculate this call's data size (32 for length + padded data)
+        const callDataNoPrefix = call.callData.startsWith("0x") ? call.callData.slice(2) : call.callData;
+        const dataLength = callDataNoPrefix.length / 2;
+        const paddedDataLength = Math.ceil(dataLength / 32) * 32;
+        // Length of callData
+        dynamicParts.push(dataLength.toString(16).padStart(64, "0"));
+        // Actual callData (padded to 32 bytes)
+        dynamicParts.push(callDataNoPrefix.padEnd(paddedDataLength * 2, "0"));
+        dataOffset += 32 + paddedDataLength; // 32 for length + padded data
+    }
+    // Append all dynamic data
+    encoded += dynamicParts.join("");
+    return "0x" + encoded.slice(2); // Ensure single 0x prefix
+}
+/**
+ * Decode Multicall3 aggregate3 results
+ */
+function decodeMulticallResults(data, numCalls) {
+    const results = [];
+    // Remove 0x prefix
+    const hex = data.startsWith("0x") ? data.slice(2) : data;
+    // First 32 bytes: offset to array
+    // Next 32 bytes: array length
+    // Then for each result: success (32 bytes) + offset to returnData (32 bytes)
+    // Then the actual return data
+    try {
+        const arrayOffset = parseInt(hex.slice(0, 64), 16) * 2;
+        const arrayLength = parseInt(hex.slice(arrayOffset, arrayOffset + 64), 16);
+        // Parse each result
+        let pos = arrayOffset + 64;
+        const resultOffsets = [];
+        for (let i = 0; i < arrayLength; i++) {
+            const resultOffset = parseInt(hex.slice(pos, pos + 64), 16) * 2;
+            resultOffsets.push(arrayOffset + 64 + resultOffset);
+            pos += 64;
+        }
+        for (const offset of resultOffsets) {
+            const success = parseInt(hex.slice(offset, offset + 64), 16) === 1;
+            const dataOffset = parseInt(hex.slice(offset + 64, offset + 128), 16) * 2;
+            const dataLength = parseInt(hex.slice(offset + 64 + dataOffset, offset + 64 + dataOffset + 64), 16);
+            const returnData = "0x" + hex.slice(offset + 64 + dataOffset + 64, offset + 64 + dataOffset + 64 + dataLength * 2);
+            results.push({ success, data: returnData });
+        }
+    }
+    catch (error) {
+        console.error("[clara] Error decoding multicall results:", error);
+        // Return empty results on decode error
+        for (let i = 0; i < numCalls; i++) {
+            results.push({ success: false, data: "0x" });
+        }
+    }
+    return results;
+}
+/**
+ * Fallback: fetch balances one by one (slower but more reliable)
+ */
+async function getAllBalancesFallback(chain, tokens) {
+    console.error(`[clara] Using fallback balance fetch for ${chain}`);
+    const balances = [];
+    // Get native balance
+    const nativeResult = await getNativeBalance(chain);
+    if (parseFloat(nativeResult.balance) > 0) {
+        balances.push({
+            symbol: nativeResult.symbol,
+            balance: nativeResult.balance,
+            balanceRaw: nativeResult.balanceRaw.toString(),
+            decimals: 18,
+        });
+    }
+    // Get each token balance
+    for (const token of tokens) {
+        try {
+            const result = await getTokenBalance(token.address, chain);
+            if (parseFloat(result.balance) > 0) {
+                balances.push({
+                    symbol: token.symbol,
+                    balance: result.balance,
+                    balanceRaw: result.balanceRaw,
+                    decimals: token.decimals,
+                    contractAddress: token.address,
+                });
+            }
+        }
+        catch {
+            // Skip tokens that fail
+        }
+    }
+    return balances;
+}
+/**
+ * Get complete portfolio - uses Zerion API when available (1 call vs 5+)
+ * Falls back to Multicall3 per-chain if Zerion unavailable
+ */
+export async function getPortfolioFast() {
+    const session = await getSession();
+    if (!session?.authenticated || !session.address) {
+        throw new Error("Not authenticated");
+    }
+    // Try Zerion first - ONE API call for all EVM chains!
+    if (isZerionAvailable()) {
+        try {
+            console.error("[clara] Building portfolio via Zerion (1 call)...");
+            const zerionPortfolio = await getPortfolioZerion(session.address);
+            // Convert Zerion format to our Portfolio format
+            const items = zerionPortfolio.positions
+                .filter(pos => pos.positionType === "wallet") // Only wallet balances, not staked
+                .map(pos => ({
+                chain: pos.chain,
+                symbol: pos.symbol,
+                balance: pos.balance,
+                priceUsd: pos.priceUsd,
+                valueUsd: pos.valueUsd,
+                change24h: pos.changePercent24h,
+            }));
+            return {
+                items,
+                totalValueUsd: zerionPortfolio.totalValueUsd,
+                totalChange24h: zerionPortfolio.totalChangePercent24h,
+                lastUpdated: zerionPortfolio.lastUpdated,
+            };
+        }
+        catch (error) {
+            console.error("[clara] Zerion failed, falling back to Multicall:", error);
+            // Fall through to Multicall fallback
+        }
+    }
+    // Fallback: Multicall3 per chain (5 RPC calls)
+    console.error("[clara] Building portfolio via Multicall3 (5 calls)...");
+    // Fetch prices
+    const prices = await fetchPrices();
+    const ethPrice = prices["ethereum"]?.usd || 0;
+    const maticPrice = prices["matic-network"]?.usd || 0;
+    // Get balances for all chains in parallel using Multicall3
+    const evmChains = ["base", "arbitrum", "optimism", "ethereum", "polygon"];
+    const chainBalances = await Promise.all(evmChains.map(async (chain) => {
+        try {
+            return { chain, balances: await getAllBalancesMulticall(chain) };
+        }
+        catch {
+            return { chain, balances: [] };
+        }
+    }));
+    // Build portfolio items
+    const items = [];
+    let totalValueUsd = 0;
+    for (const { chain, balances } of chainBalances) {
+        for (const bal of balances) {
+            const balanceNum = parseFloat(bal.balance);
+            // Calculate USD value
+            let priceUsd = null;
+            if (bal.symbol === "ETH" || bal.symbol === "WETH") {
+                priceUsd = ethPrice;
+            }
+            else if (bal.symbol === "MATIC") {
+                priceUsd = maticPrice;
+            }
+            else if (STABLE_TOKENS.has(bal.symbol)) {
+                priceUsd = 1.0;
+            }
+            const valueUsd = priceUsd ? balanceNum * priceUsd : null;
+            if (valueUsd)
+                totalValueUsd += valueUsd;
+            items.push({
+                chain,
+                symbol: bal.symbol,
+                balance: bal.balance,
+                priceUsd,
+                valueUsd,
+                change24h: bal.symbol === "ETH" ? prices["ethereum"]?.usd_24h_change || null : null,
+            });
+        }
+    }
+    return {
+        items,
+        totalValueUsd,
+        totalChange24h: prices["ethereum"]?.usd_24h_change || null,
+        lastUpdated: new Date().toISOString(),
+    };
 }
 /**
  * Sign an arbitrary message using Para REST API
@@ -532,38 +1185,72 @@ export async function signTransaction(tx, chain) {
             const signature = await signMessage(intentMessage, chain);
             return { signedTx: signature };
         }
-        // EVM transaction signing
+        // EVM transaction signing with proper EIP-1559 encoding
         const evmWalletId = session.walletId;
         if (!evmWalletId) {
             throw new Error("No EVM wallet found");
         }
         const evmTx = tx;
         const config = CHAIN_CONFIG[chain];
-        // Build unsigned transaction object
-        const unsignedTx = {
-            to: evmTx.to,
-            value: evmTx.value ? `0x${BigInt(evmTx.value).toString(16)}` : "0x0",
-            data: evmTx.data || "0x",
-            gasLimit: evmTx.gasLimit || "0x5208",
-            maxFeePerGas: evmTx.maxFeePerGas || "0x3b9aca00",
-            maxPriorityFeePerGas: evmTx.maxPriorityFeePerGas || "0x3b9aca00",
+        if (!config.chainId) {
+            throw new Error(`Chain ${chain} does not have a chainId configured`);
+        }
+        // Get wallet address for nonce lookup
+        const address = session.address;
+        if (!address) {
+            throw new Error("No wallet address found in session");
+        }
+        // Get current nonce, gas prices, and estimate gas
+        const [nonce, gasPrices, gasEstimate] = await Promise.all([
+            fetchNonce(address, chain),
+            fetchGasPrices(chain),
+            fetchGasLimit({ to: evmTx.to, from: address, value: evmTx.value, data: evmTx.data }, chain),
+        ]);
+        // Build the transaction object
+        const txParams = {
             chainId: config.chainId,
-            type: 2,
-            nonce: 0,
+            nonce,
+            maxPriorityFeePerGas: evmTx.maxPriorityFeePerGas
+                ? BigInt(evmTx.maxPriorityFeePerGas)
+                : gasPrices.maxPriorityFeePerGas,
+            maxFeePerGas: evmTx.maxFeePerGas
+                ? BigInt(evmTx.maxFeePerGas)
+                : gasPrices.maxFeePerGas,
+            gasLimit: evmTx.gasLimit
+                ? BigInt(evmTx.gasLimit)
+                : gasEstimate,
+            to: evmTx.to,
+            value: evmTx.value ? BigInt(evmTx.value) : 0n,
+            data: evmTx.data || "0x",
         };
-        // Sign the transaction data using sign-raw endpoint
-        // For proper EVM tx signing, you'd use RLP encoding here
-        // This is a simplified version - for production, use ethers.js
-        const txDataHex = "0x" + Buffer.from(JSON.stringify(unsignedTx)).toString("hex");
+        // Step 1: Encode unsigned transaction and hash it
+        const unsignedTxBytes = encodeUnsignedEIP1559Tx(txParams);
+        const txHash = keccak_256(unsignedTxBytes);
+        const txHashHex = "0x" + Array.from(txHash).map(b => b.toString(16).padStart(2, "0")).join("");
+        // Step 2: Sign the hash with Para
         const response = await paraFetch(`/v1/wallets/${evmWalletId}/sign-raw`, {
             method: "POST",
             body: JSON.stringify({
-                data: txDataHex,
+                data: txHashHex,
             }),
         });
-        const result = (await response.json());
+        const responseText = await response.text();
+        if (!response.ok) {
+            throw new Error(`Para sign-raw failed: ${response.status} - ${responseText}`);
+        }
+        const result = JSON.parse(responseText);
+        // Step 3: Parse signature into r, s, v
+        const { r, s, v } = parseSignature(result.signature);
+        // Step 4: Encode the signed transaction
+        const signedTxBytes = encodeSignedEIP1559Tx({
+            ...txParams,
+            v,
+            r,
+            s,
+        });
+        const signedTxHex = bytesToHex(signedTxBytes);
         return {
-            signedTx: result.signature,
+            signedTx: signedTxHex,
         };
     }
     catch (error) {
@@ -616,7 +1303,7 @@ export async function sendTransaction(to, amount, chain, _tokenAddress, data // 
         });
         const rpcResult = (await response.json());
         if (rpcResult.error) {
-            throw new Error(rpcResult.error.message);
+            throw new Error(`RPC error ${rpcResult.error.code || ''}: ${rpcResult.error.message}`);
         }
         return { txHash: rpcResult.result || signed.txHash || "" };
     }
@@ -624,6 +1311,55 @@ export async function sendTransaction(to, amount, chain, _tokenAddress, data // 
         console.error("[clara] Send error:", error);
         throw error;
     }
+}
+/**
+ * Wait for a transaction to be confirmed
+ *
+ * @param txHash - Transaction hash to wait for
+ * @param chain - Chain the transaction was sent on
+ * @param options - Polling options
+ * @returns Transaction receipt
+ */
+export async function waitForTransaction(txHash, chain, options = {}) {
+    if (chain === "solana") {
+        // Solana not supported for now
+        return { status: "success" };
+    }
+    const pollInterval = options.pollIntervalMs || 3000; // 3 seconds
+    const timeout = options.timeoutMs || 2 * 60 * 1000; // 2 minutes
+    const startTime = Date.now();
+    const config = CHAIN_CONFIG[chain];
+    while (Date.now() - startTime < timeout) {
+        try {
+            const response = await fetch(config.rpcUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    jsonrpc: "2.0",
+                    method: "eth_getTransactionReceipt",
+                    params: [txHash],
+                    id: 1,
+                }),
+            });
+            const result = await response.json();
+            if (result.result) {
+                // Transaction mined
+                const receipt = result.result;
+                return {
+                    status: receipt.status === "0x1" ? "success" : "reverted",
+                    blockNumber: receipt.blockNumber,
+                    gasUsed: receipt.gasUsed,
+                    effectiveGasPrice: receipt.effectiveGasPrice,
+                };
+            }
+            // Not yet mined, continue polling
+        }
+        catch (error) {
+            console.error("[clara] Receipt poll error:", error);
+        }
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+    }
+    return { status: "pending" };
 }
 /**
  * Estimate gas for a transaction
@@ -731,6 +1467,86 @@ export async function fetchPrices() {
         console.error("[clara] Price fetch error:", error);
         return {};
     }
+}
+/**
+ * Token price mapping for yield position valuation
+ * Stablecoins are assumed to be $1 (more reliable than API for DeFi calculations)
+ * Non-stables fetch from CoinGecko
+ */
+const STABLE_TOKENS = new Set(["USDC", "USDT", "DAI", "USDbC", "USDC.e", "FRAX", "LUSD", "sUSD"]);
+// CoinGecko token IDs for non-stablecoin yield assets
+const TOKEN_COINGECKO_IDS = {
+    WETH: "ethereum",
+    ETH: "ethereum",
+    WBTC: "wrapped-bitcoin",
+    wstETH: "wrapped-steth",
+    cbETH: "coinbase-wrapped-staked-eth",
+    rETH: "rocket-pool-eth",
+};
+/**
+ * Get USD price for a token
+ * Stablecoins return 1.0, others fetch from CoinGecko
+ */
+export async function getTokenPriceUsd(symbol) {
+    // Stablecoins are ~$1
+    if (STABLE_TOKENS.has(symbol)) {
+        return 1.0;
+    }
+    // Check if we have a CoinGecko ID for this token
+    const geckoId = TOKEN_COINGECKO_IDS[symbol];
+    if (!geckoId) {
+        console.error(`[clara] No price source for ${symbol}`);
+        return null;
+    }
+    try {
+        const response = await fetch(`${COINGECKO_API}/simple/price?ids=${geckoId}&vs_currencies=usd`, { headers: { "Accept": "application/json" } });
+        if (!response.ok) {
+            console.error(`[clara] Price fetch error for ${symbol}: ${response.status}`);
+            return null;
+        }
+        const data = await response.json();
+        return data[geckoId]?.usd ?? null;
+    }
+    catch (error) {
+        console.error(`[clara] Price fetch error for ${symbol}:`, error);
+        return null;
+    }
+}
+/**
+ * Batch fetch prices for multiple tokens (efficient for portfolio)
+ */
+export async function getTokenPricesUsd(symbols) {
+    const prices = {};
+    // Handle stablecoins first (no API call needed)
+    for (const symbol of symbols) {
+        if (STABLE_TOKENS.has(symbol)) {
+            prices[symbol] = 1.0;
+        }
+    }
+    // Collect non-stables that need API fetch
+    const nonStables = symbols.filter(s => !STABLE_TOKENS.has(s));
+    const geckoIds = nonStables
+        .map(s => TOKEN_COINGECKO_IDS[s])
+        .filter(Boolean);
+    if (geckoIds.length === 0) {
+        return prices;
+    }
+    try {
+        const response = await fetch(`${COINGECKO_API}/simple/price?ids=${[...new Set(geckoIds)].join(",")}&vs_currencies=usd`, { headers: { "Accept": "application/json" } });
+        if (response.ok) {
+            const data = await response.json();
+            for (const symbol of nonStables) {
+                const geckoId = TOKEN_COINGECKO_IDS[symbol];
+                if (geckoId && data[geckoId]) {
+                    prices[symbol] = data[geckoId].usd;
+                }
+            }
+        }
+    }
+    catch (error) {
+        console.error("[clara] Batch price fetch error:", error);
+    }
+    return prices;
 }
 /**
  * Get portfolio across all chains
@@ -1252,7 +2068,10 @@ export async function simulateTransaction(tx, chain) {
     };
 }
 /**
- * Fetch transaction history from block explorer API
+ * Fetch transaction history
+ *
+ * Uses Zerion API if ZERION_API_KEY is set (richer data, more reliable)
+ * Falls back to block explorer APIs otherwise (basic but works without key)
  */
 export async function getTransactionHistory(chain, options = {}) {
     const session = await getSession();
@@ -1262,7 +2081,6 @@ export async function getTransactionHistory(chain, options = {}) {
     const { limit = 10, includeTokenTransfers = true } = options;
     const address = session.address.toLowerCase();
     if (chain === "solana") {
-        // Solana history not yet supported
         return {
             transactions: [],
             address: session.solanaAddress || address,
@@ -1270,11 +2088,58 @@ export async function getTransactionHistory(chain, options = {}) {
             hasMore: false,
         };
     }
+    // Try Zerion first if API key is configured
+    if (isZerionAvailable()) {
+        try {
+            const zerionResult = await getTransactionHistoryZerion(address, chain, { limit });
+            const transactions = zerionResult.transactions.map((tx) => {
+                const hasIncoming = tx.transfers.some((t) => t.direction === "in");
+                const hasOutgoing = tx.transfers.some((t) => t.direction === "out");
+                const isIncoming = hasIncoming && !hasOutgoing;
+                const mainTransfer = tx.transfers[0];
+                let tokenSymbol;
+                let tokenAmount;
+                if (mainTransfer && mainTransfer.symbol !== "ETH") {
+                    tokenSymbol = mainTransfer.symbol;
+                    tokenAmount = mainTransfer.amount.toFixed(6);
+                }
+                return {
+                    hash: tx.hash,
+                    chain: tx.chain,
+                    from: tx.from,
+                    to: tx.to,
+                    valueEth: tx.valueEth,
+                    timestamp: tx.timestamp,
+                    date: tx.date,
+                    action: tx.action,
+                    actionType: tx.actionType,
+                    status: tx.status,
+                    gasUsedEth: tx.gasUsedEth,
+                    gasUsedUsd: tx.gasUsedUsd,
+                    tokenSymbol,
+                    tokenAmount,
+                    isIncoming,
+                    explorerUrl: tx.explorerUrl,
+                    dappName: tx.dappName,
+                    transfers: tx.transfers,
+                    approvals: tx.approvals,
+                };
+            });
+            return { transactions, address, chain, hasMore: zerionResult.hasMore };
+        }
+        catch (error) {
+            console.error(`[clara] Zerion API failed, falling back to block explorer:`, error);
+        }
+    }
+    // Fallback: Block explorer APIs
+    // NOTE: Etherscan V1 API is deprecated - V2 requires API key
+    // For now, return empty with a helpful message
     const explorer = EXPLORER_CONFIG[chain];
     if (!explorer) {
         throw new Error(`Explorer not configured for ${chain}`);
     }
-    console.error(`[clara] Fetching transaction history for ${address} on ${chain}`);
+    console.error(`[clara] Fetching history via block explorer for ${address} on ${chain}`);
+    console.error(`[clara] Note: Block explorer APIs now require API keys. Set ZERION_API_KEY for best results.`);
     const transactions = [];
     try {
         // Fetch normal transactions
@@ -1287,7 +2152,6 @@ export async function getTransactionHistory(chain, options = {}) {
                 const valueEth = Number(valueWei) / 1e18;
                 const isIncoming = tx.to.toLowerCase() === address;
                 const timestamp = parseInt(tx.timeStamp) * 1000;
-                // Decode action
                 let action = "Contract Call";
                 const selector = tx.input?.slice(0, 10) || "0x";
                 if (!tx.input || tx.input === "0x") {
@@ -1297,7 +2161,6 @@ export async function getTransactionHistory(chain, options = {}) {
                     action = FUNCTION_SIGNATURES[selector].name;
                 }
                 else if (tx.functionName) {
-                    // Extract function name from "functionName(params)"
                     action = tx.functionName.split("(")[0];
                 }
                 transactions.push({
@@ -1323,14 +2186,13 @@ export async function getTransactionHistory(chain, options = {}) {
                 });
             }
         }
-        // Fetch ERC-20 token transfers if requested
+        // Fetch ERC-20 token transfers
         if (includeTokenTransfers) {
             const tokenTxUrl = `${explorer.apiUrl}?module=account&action=tokentx&address=${address}&startblock=0&endblock=99999999&page=1&offset=${limit}&sort=desc`;
             const tokenResponse = await fetch(tokenTxUrl);
             const tokenData = (await tokenResponse.json());
             if (tokenData.status === "1" && Array.isArray(tokenData.result)) {
                 for (const tx of tokenData.result) {
-                    // Skip if we already have this tx from normal list
                     if (transactions.some((t) => t.hash === tx.hash))
                         continue;
                     const decimals = parseInt(tx.tokenDecimal) || 18;
@@ -1362,12 +2224,9 @@ export async function getTransactionHistory(chain, options = {}) {
                 }
             }
         }
-        // Sort by timestamp descending
         transactions.sort((a, b) => b.timestamp - a.timestamp);
-        // Limit results
-        const limitedTxs = transactions.slice(0, limit);
         return {
-            transactions: limitedTxs,
+            transactions: transactions.slice(0, limit),
             address,
             chain,
             hasMore: transactions.length > limit,
@@ -1375,28 +2234,59 @@ export async function getTransactionHistory(chain, options = {}) {
     }
     catch (error) {
         console.error(`[clara] Failed to fetch history:`, error);
-        return {
-            transactions: [],
-            address,
-            chain,
-            hasMore: false,
-        };
+        return { transactions: [], address, chain, hasMore: false };
     }
 }
 /**
  * Format a transaction for display
  */
 export function formatTransaction(tx) {
-    const icon = tx.status === "failed" ? "❌" : tx.isIncoming ? "📥" : "📤";
-    const amount = tx.tokenAmount
-        ? `${tx.tokenAmount} ${tx.tokenSymbol}`
-        : tx.valueEth > 0
-            ? `${tx.valueEth.toFixed(4)} ETH`
-            : "";
+    // Status icon
+    const statusIcon = tx.status === "failed" ? "❌" : tx.status === "pending" ? "⏳" : "✓";
+    // Direction icon based on action type or isIncoming
+    let dirIcon = "📤";
+    if (tx.actionType === "receive" || tx.isIncoming) {
+        dirIcon = "📥";
+    }
+    else if (tx.actionType === "trade") {
+        dirIcon = "🔄";
+    }
+    else if (tx.actionType === "approve") {
+        dirIcon = "✅";
+    }
+    // Build amount string
+    let amount = "";
+    if (tx.transfers && tx.transfers.length > 0) {
+        if (tx.actionType === "trade" && tx.transfers.length >= 2) {
+            // Swap: show both tokens
+            const outTx = tx.transfers.find((t) => t.direction === "out");
+            const inTx = tx.transfers.find((t) => t.direction === "in");
+            if (outTx && inTx) {
+                amount = `${outTx.amount.toFixed(4)} ${outTx.symbol} → ${inTx.amount.toFixed(4)} ${inTx.symbol}`;
+            }
+        }
+        else {
+            // Single transfer
+            const mainTransfer = tx.transfers[0];
+            amount = `${mainTransfer.amount.toFixed(4)} ${mainTransfer.symbol}`;
+            if (mainTransfer.usdValue && mainTransfer.usdValue > 0.01) {
+                amount += ` ($${mainTransfer.usdValue.toFixed(2)})`;
+            }
+        }
+    }
+    else if (tx.tokenAmount) {
+        amount = `${tx.tokenAmount} ${tx.tokenSymbol}`;
+    }
+    else if (tx.valueEth > 0) {
+        amount = `${tx.valueEth.toFixed(4)} ETH`;
+    }
+    // Counterparty
     const counterparty = tx.isIncoming
         ? `from ${tx.from.slice(0, 6)}...${tx.from.slice(-4)}`
         : `to ${tx.to.slice(0, 6)}...${tx.to.slice(-4)}`;
-    return `${icon} ${tx.action}${amount ? ` (${amount})` : ""} ${counterparty} • ${tx.date}`;
+    // Dapp name if available
+    const via = tx.dappName ? ` via ${tx.dappName}` : "";
+    return `${statusIcon} ${dirIcon} ${tx.action}${amount ? ` (${amount})` : ""} ${counterparty}${via} • ${tx.date}`;
 }
 // Max uint256 value (unlimited approval)
 const MAX_UINT256 = BigInt("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
@@ -1588,26 +2478,45 @@ export function formatApproval(approval) {
     return `${riskIcon} ${approval.tokenSymbol} → ${spenderDisplay}: ${approval.allowance}`;
 }
 // ============================================================================
-// Token Swaps (via Li.Fi Aggregator)
+// Token Swaps (Meta-Aggregation: Li.Fi + 0x)
 // ============================================================================
 // Li.Fi API - aggregates across multiple DEXs, no API key required
 const LIFI_API = "https://li.quest/v1";
-// Map our chain names to Li.Fi chain IDs
-const LIFI_CHAIN_IDS = {
+// 0x Swap API v2 - professional market makers + DEX aggregation
+// API key optional but recommended for higher rate limits
+const ZEROX_API = "https://api.0x.org/swap/allowance-holder";
+const ZEROX_API_KEY = process.env.ZEROX_API_KEY || "";
+// Map our chain names to chain IDs (shared by both aggregators)
+const CHAIN_IDS = {
     ethereum: 1,
     base: 8453,
     arbitrum: 42161,
     optimism: 10,
     polygon: 137,
-    solana: null, // Li.Fi doesn't support Solana swaps
+    solana: null, // Neither aggregator supports Solana swaps
 };
+// Alias for backward compatibility
+const LIFI_CHAIN_IDS = CHAIN_IDS;
 // Native token address placeholder (used by Li.Fi for ETH/MATIC/etc)
 const NATIVE_TOKEN_ADDRESS = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+// 0x uses different native token representation
+const ZEROX_NATIVE_TOKEN = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 /**
  * Get a swap quote from Li.Fi
  * Finds the best route across multiple DEXs
+ *
+ * @param fromToken - Token to sell (symbol or address)
+ * @param toToken - Token to buy (symbol or address)
+ * @param amount - Amount to swap (human-readable)
+ * @param chain - Blockchain to swap on
+ * @param options - Optional: slippage, preferredDex for Boost routing
  */
-export async function getSwapQuote(fromToken, toToken, amount, chain, slippage = 0.5) {
+export async function getSwapQuote(fromToken, toToken, amount, chain, options = {}) {
+    // Handle legacy signature where 5th param was slippage number
+    const opts = typeof options === "number"
+        ? { slippage: options }
+        : options;
+    const slippage = opts.slippage ?? 0.5;
     const session = await getSession();
     if (!session?.authenticated || !session.address) {
         throw new Error("Not authenticated");
@@ -1653,9 +2562,9 @@ export async function getSwapQuote(fromToken, toToken, amount, chain, slippage =
         const metadata = await getTokenMetadata(fromAddress, chain);
         fromDecimals = metadata.decimals;
     }
-    // Convert amount to raw units
-    const amountRaw = BigInt(Math.floor(parseFloat(amount) * Math.pow(10, fromDecimals)));
-    console.error(`[clara] Getting swap quote: ${amount} ${fromToken} → ${toToken} on ${chain}`);
+    // Convert amount to raw units (using precise BigInt parsing)
+    const amountRaw = parseAmountToBigInt(amount, fromDecimals);
+    console.error(`[clara] Getting swap quote: ${amount} ${fromToken} → ${toToken} on ${chain}${opts.preferredDex ? ` (prefer: ${opts.preferredDex})` : ""}`);
     // Call Li.Fi quote endpoint
     const params = new URLSearchParams({
         fromChain: chainId.toString(),
@@ -1666,6 +2575,15 @@ export async function getSwapQuote(fromToken, toToken, amount, chain, slippage =
         fromAddress: session.address,
         slippage: (slippage / 100).toString(), // Convert percentage to decimal
     });
+    // Add Boost-aware routing preferences
+    if (opts.preferredDex) {
+        // Li.Fi uses "dexs" param to limit to specific DEXes
+        params.append("dexs", opts.preferredDex);
+        console.error(`[clara] Boost routing: preferring ${opts.preferredDex}`);
+    }
+    if (opts.denyDexes && opts.denyDexes.length > 0) {
+        params.append("denyExchanges", opts.denyDexes.join(","));
+    }
     try {
         const response = await fetch(`${LIFI_API}/quote?${params}`);
         if (!response.ok) {
@@ -1697,6 +2615,7 @@ export async function getSwapQuote(fromToken, toToken, amount, chain, slippage =
         const totalGasEstimate = data.estimate.gasCosts.reduce((sum, g) => sum + parseInt(g.estimate || "0"), 0);
         return {
             id: data.id,
+            source: "lifi",
             fromToken: {
                 address: data.action.fromToken.address,
                 symbol: data.action.fromToken.symbol,
@@ -1732,9 +2651,465 @@ export async function getSwapQuote(fromToken, toToken, amount, chain, slippage =
         };
     }
     catch (error) {
-        console.error(`[clara] Swap quote error:`, error);
+        console.error(`[clara] Li.Fi quote error:`, error);
         throw error;
     }
+}
+/**
+ * Get a swap quote from 0x Swap API v2
+ * Provides access to professional market makers + DEX aggregation
+ *
+ * @param fromToken - Token to sell (symbol or address)
+ * @param toToken - Token to buy (symbol or address)
+ * @param amount - Amount to swap (human-readable)
+ * @param chain - Blockchain to swap on
+ * @param options - Optional: slippage
+ */
+async function getSwapQuoteFrom0x(fromToken, toToken, amount, chain, options = {}) {
+    const slippage = options.slippage ?? 0.5;
+    const session = await getSession();
+    if (!session?.authenticated || !session.address) {
+        throw new Error("Not authenticated");
+    }
+    const chainId = CHAIN_IDS[chain];
+    if (!chainId) {
+        throw new Error(`Swaps not supported on ${chain}`);
+    }
+    // Resolve token addresses
+    let fromAddress;
+    let toAddress;
+    let fromDecimals = 18;
+    let toDecimals = 18;
+    let fromSymbol = fromToken;
+    let toSymbol = toToken;
+    const nativeSymbols = ["ETH", "MATIC", "NATIVE"];
+    if (nativeSymbols.includes(fromToken.toUpperCase())) {
+        fromAddress = ZEROX_NATIVE_TOKEN;
+        fromSymbol = chain === "polygon" ? "MATIC" : "ETH";
+    }
+    else if (fromToken.startsWith("0x")) {
+        fromAddress = fromToken;
+        const metadata = await getTokenMetadata(fromToken, chain);
+        fromDecimals = metadata.decimals;
+        fromSymbol = metadata.symbol;
+    }
+    else {
+        const resolved = resolveToken(fromToken, chain);
+        if (!resolved)
+            throw new Error(`Unknown token: ${fromToken} on ${chain}`);
+        fromAddress = resolved.address;
+        fromDecimals = resolved.decimals;
+        fromSymbol = resolved.symbol;
+    }
+    if (nativeSymbols.includes(toToken.toUpperCase())) {
+        toAddress = ZEROX_NATIVE_TOKEN;
+        toSymbol = chain === "polygon" ? "MATIC" : "ETH";
+    }
+    else if (toToken.startsWith("0x")) {
+        toAddress = toToken;
+        const metadata = await getTokenMetadata(toToken, chain);
+        toDecimals = metadata.decimals;
+        toSymbol = metadata.symbol;
+    }
+    else {
+        const resolved = resolveToken(toToken, chain);
+        if (!resolved)
+            throw new Error(`Unknown token: ${toToken} on ${chain}`);
+        toAddress = resolved.address;
+        toDecimals = resolved.decimals;
+        toSymbol = resolved.symbol;
+    }
+    // Convert amount to raw units
+    const amountRaw = parseAmountToBigInt(amount, fromDecimals);
+    console.error(`[clara] Getting 0x quote: ${amount} ${fromSymbol} → ${toSymbol} on ${chain}`);
+    // Build 0x API request
+    const params = new URLSearchParams({
+        chainId: chainId.toString(),
+        sellToken: fromAddress,
+        buyToken: toAddress,
+        sellAmount: amountRaw.toString(),
+        taker: session.address,
+        slippageBps: Math.round(slippage * 100).toString(), // Convert % to basis points
+    });
+    const headers = {
+        "0x-version": "v2",
+    };
+    // Add API key if available (for higher rate limits)
+    if (ZEROX_API_KEY) {
+        headers["0x-api-key"] = ZEROX_API_KEY;
+    }
+    const response = await fetch(`${ZEROX_API}/quote?${params}`, { headers });
+    if (!response.ok) {
+        const error = await response.text();
+        console.error(`[clara] 0x API error: ${response.status} - ${error}`);
+        throw new Error(`0x quote failed: ${response.status}`);
+    }
+    const data = await response.json();
+    if (!data.liquidityAvailable) {
+        throw new Error("No liquidity available for this swap on 0x");
+    }
+    // Calculate amounts
+    const toAmountNum = Number(BigInt(data.buyAmount)) / Math.pow(10, toDecimals);
+    const toAmountMinNum = Number(BigInt(data.minBuyAmount)) / Math.pow(10, toDecimals);
+    const fromAmountNum = parseFloat(amount);
+    const exchangeRate = (toAmountNum / fromAmountNum).toFixed(6);
+    // Get gas cost in USD (rough estimate)
+    const gasEstimate = data.transaction?.gas || "200000";
+    const gasCostUsd = (parseInt(gasEstimate) * 0.00000001 * 2500).toFixed(2); // Rough ETH price estimate
+    // Check for approval requirement
+    const needsApproval = !!data.issues?.allowance;
+    const approvalAddress = data.issues?.allowance?.spender;
+    // Get liquidity sources
+    const sources = [...new Set(data.route?.fills?.map(f => f.source) || [])];
+    const toolDetails = sources.length > 0 ? sources.join(" → ") : "0x";
+    return {
+        id: `0x-${Date.now()}`,
+        source: "0x",
+        fromToken: {
+            address: fromAddress,
+            symbol: fromSymbol,
+            decimals: fromDecimals,
+            priceUsd: "0", // 0x doesn't provide USD prices in basic response
+        },
+        toToken: {
+            address: toAddress,
+            symbol: toSymbol,
+            decimals: toDecimals,
+            priceUsd: "0",
+        },
+        fromAmount: amount,
+        fromAmountUsd: "0", // Would need price feed
+        toAmount: toAmountNum.toFixed(toDecimals > 6 ? 6 : toDecimals),
+        toAmountUsd: "0",
+        toAmountMin: toAmountMinNum.toFixed(6),
+        exchangeRate,
+        priceImpact: "0", // 0x doesn't provide this directly
+        estimatedGas: gasEstimate,
+        estimatedGasUsd: gasCostUsd,
+        approvalAddress,
+        needsApproval,
+        transactionRequest: data.transaction ? {
+            to: data.transaction.to,
+            data: data.transaction.data,
+            value: data.transaction.value,
+            gasLimit: data.transaction.gas,
+        } : undefined,
+        tool: "0x",
+        toolDetails,
+    };
+}
+/**
+ * Get the best swap quote from multiple aggregators (meta-aggregation)
+ * Queries Li.Fi and 0x in parallel, returns the quote with best output
+ *
+ * @param fromToken - Token to sell (symbol or address)
+ * @param toToken - Token to buy (symbol or address)
+ * @param amount - Amount to swap (human-readable)
+ * @param chain - Blockchain to swap on
+ * @param options - Optional: slippage, preferredDex
+ */
+export async function getSwapQuoteBest(fromToken, toToken, amount, chain, options = {}) {
+    console.error(`[clara] Meta-aggregation: querying Li.Fi + 0x for best quote...`);
+    // Query both aggregators in parallel
+    const [lifiResult, zeroxResult] = await Promise.allSettled([
+        getSwapQuote(fromToken, toToken, amount, chain, options),
+        getSwapQuoteFrom0x(fromToken, toToken, amount, chain, options),
+    ]);
+    const quotes = [];
+    if (lifiResult.status === "fulfilled") {
+        quotes.push(lifiResult.value);
+        console.error(`[clara] Li.Fi quote: ${lifiResult.value.toAmount} ${lifiResult.value.toToken.symbol}`);
+    }
+    else {
+        console.error(`[clara] Li.Fi failed: ${lifiResult.reason}`);
+    }
+    if (zeroxResult.status === "fulfilled") {
+        quotes.push(zeroxResult.value);
+        console.error(`[clara] 0x quote: ${zeroxResult.value.toAmount} ${zeroxResult.value.toToken.symbol}`);
+    }
+    else {
+        console.error(`[clara] 0x failed: ${zeroxResult.reason}`);
+    }
+    if (quotes.length === 0) {
+        throw new Error("All aggregators failed to provide a quote");
+    }
+    // Find the best quote (highest output amount)
+    const bestQuote = quotes.reduce((best, current) => {
+        const bestAmount = parseFloat(best.toAmount);
+        const currentAmount = parseFloat(current.toAmount);
+        return currentAmount > bestAmount ? current : best;
+    });
+    console.error(`[clara] Best quote: ${bestQuote.source} with ${bestQuote.toAmount} ${bestQuote.toToken.symbol}`);
+    return bestQuote;
+}
+/**
+ * Get a cross-chain bridge quote from Li.Fi
+ * Supports same-token bridging and cross-chain swaps
+ *
+ * @param fromToken - Token to send (symbol or address)
+ * @param toToken - Token to receive (symbol or address, can be different)
+ * @param amount - Amount to bridge (human-readable)
+ * @param fromChain - Source blockchain
+ * @param toChain - Destination blockchain
+ * @param options - Optional: slippage, preferred bridges
+ */
+export async function getBridgeQuote(fromToken, toToken, amount, fromChain, toChain, options = {}) {
+    const slippage = options.slippage ?? 0.5;
+    const session = await getSession();
+    if (!session?.authenticated || !session.address) {
+        throw new Error("Not authenticated");
+    }
+    const fromChainId = CHAIN_IDS[fromChain];
+    const toChainId = CHAIN_IDS[toChain];
+    if (!fromChainId) {
+        throw new Error(`Bridging not supported from ${fromChain}`);
+    }
+    if (!toChainId) {
+        throw new Error(`Bridging not supported to ${toChain}`);
+    }
+    // Resolve source token address
+    let fromAddress;
+    const nativeSymbols = ["ETH", "MATIC", "NATIVE"];
+    if (nativeSymbols.includes(fromToken.toUpperCase())) {
+        fromAddress = NATIVE_TOKEN_ADDRESS;
+    }
+    else if (fromToken.startsWith("0x")) {
+        fromAddress = fromToken;
+    }
+    else {
+        const resolved = resolveToken(fromToken, fromChain);
+        if (!resolved) {
+            throw new Error(`Unknown token: ${fromToken} on ${fromChain}`);
+        }
+        fromAddress = resolved.address;
+    }
+    // Resolve destination token address
+    let toAddress;
+    if (nativeSymbols.includes(toToken.toUpperCase())) {
+        toAddress = NATIVE_TOKEN_ADDRESS;
+    }
+    else if (toToken.startsWith("0x")) {
+        toAddress = toToken;
+    }
+    else {
+        const resolved = resolveToken(toToken, toChain);
+        if (!resolved) {
+            throw new Error(`Unknown token: ${toToken} on ${toChain}`);
+        }
+        toAddress = resolved.address;
+    }
+    // Get token metadata for amount conversion
+    let fromDecimals = 18;
+    if (fromAddress !== NATIVE_TOKEN_ADDRESS) {
+        const metadata = await getTokenMetadata(fromAddress, fromChain);
+        fromDecimals = metadata.decimals;
+    }
+    // Convert amount to raw units
+    const amountRaw = parseAmountToBigInt(amount, fromDecimals);
+    const isCrossChainSwap = fromToken.toUpperCase() !== toToken.toUpperCase();
+    const actionType = isCrossChainSwap ? "cross-chain swap" : "bridge";
+    console.error(`[clara] Getting ${actionType} quote: ${amount} ${fromToken} (${fromChain}) → ${toToken} (${toChain})`);
+    // Call Li.Fi quote endpoint with different chains
+    const params = new URLSearchParams({
+        fromChain: fromChainId.toString(),
+        toChain: toChainId.toString(),
+        fromToken: fromAddress,
+        toToken: toAddress,
+        fromAmount: amountRaw.toString(),
+        fromAddress: session.address,
+        slippage: (slippage / 100).toString(),
+    });
+    // Add bridge preferences
+    if (options.preferredBridges && options.preferredBridges.length > 0) {
+        params.append("bridges", options.preferredBridges.join(","));
+    }
+    if (options.denyBridges && options.denyBridges.length > 0) {
+        params.append("denyBridges", options.denyBridges.join(","));
+    }
+    try {
+        const response = await fetch(`${LIFI_API}/quote?${params}`);
+        if (!response.ok) {
+            const error = await response.text();
+            console.error(`[clara] Li.Fi bridge API error: ${response.status} - ${error}`);
+            throw new Error(`Bridge quote failed: ${response.status}`);
+        }
+        const data = await response.json();
+        // Calculate exchange rate
+        const fromAmountNum = parseFloat(amount);
+        const toAmountNum = Number(BigInt(data.estimate.toAmount)) / Math.pow(10, data.action.toToken.decimals);
+        const exchangeRate = (toAmountNum / fromAmountNum).toFixed(6);
+        // Check if approval is needed
+        let needsApproval = false;
+        let currentAllowance;
+        if (fromAddress !== NATIVE_TOKEN_ADDRESS && data.estimate.approvalAddress) {
+            const approval = await getAllowance(fromAddress, data.estimate.approvalAddress, fromChain);
+            const requiredAmount = BigInt(data.action.fromAmount);
+            const currentAmount = BigInt(approval.allowanceRaw);
+            needsApproval = currentAmount < requiredAmount;
+            currentAllowance = approval.allowance;
+        }
+        // Sum up gas costs
+        const totalGasUsd = data.estimate.gasCosts.reduce((sum, g) => sum + parseFloat(g.amountUSD || "0"), 0);
+        // Build steps array
+        const steps = (data.includedSteps || []).map(step => ({
+            type: step.type,
+            tool: step.tool,
+            fromChain: Object.entries(CHAIN_IDS).find(([, id]) => id === step.action.fromChainId)?.[0] || "unknown",
+            toChain: Object.entries(CHAIN_IDS).find(([, id]) => id === step.action.toChainId)?.[0] || "unknown",
+            fromToken: step.action.fromToken.symbol,
+            toToken: step.action.toToken.symbol,
+        }));
+        return {
+            id: data.id,
+            fromChain,
+            toChain,
+            fromToken: {
+                address: data.action.fromToken.address,
+                symbol: data.action.fromToken.symbol,
+                decimals: data.action.fromToken.decimals,
+                priceUsd: data.action.fromToken.priceUSD,
+            },
+            toToken: {
+                address: data.action.toToken.address,
+                symbol: data.action.toToken.symbol,
+                decimals: data.action.toToken.decimals,
+                priceUsd: data.action.toToken.priceUSD,
+            },
+            fromAmount: amount,
+            fromAmountUsd: data.estimate.fromAmountUSD || "0",
+            toAmount: toAmountNum.toFixed(data.action.toToken.decimals > 6 ? 6 : data.action.toToken.decimals),
+            toAmountUsd: data.estimate.toAmountUSD || "0",
+            toAmountMin: (Number(BigInt(data.estimate.toAmountMin)) / Math.pow(10, data.action.toToken.decimals)).toFixed(6),
+            exchangeRate,
+            estimatedTime: data.estimate.executionDuration,
+            estimatedGasUsd: totalGasUsd.toFixed(2),
+            approvalAddress: data.estimate.approvalAddress,
+            needsApproval,
+            currentAllowance,
+            transactionRequest: data.transactionRequest ? {
+                to: data.transactionRequest.to,
+                data: data.transactionRequest.data,
+                value: data.transactionRequest.value,
+                gasLimit: data.transactionRequest.gasLimit,
+            } : undefined,
+            tool: data.tool,
+            toolDetails: data.toolDetails?.name,
+            steps,
+        };
+    }
+    catch (error) {
+        console.error(`[clara] Bridge quote error:`, error);
+        throw error;
+    }
+}
+/**
+ * Execute a bridge using the quote's transaction request
+ * Note: This initiates the bridge on the source chain.
+ * The tokens will arrive on the destination chain after the estimated time.
+ */
+export async function executeBridge(quote) {
+    if (!quote.transactionRequest) {
+        throw new Error("Quote does not include transaction data. Get a fresh quote.");
+    }
+    if (quote.needsApproval) {
+        throw new Error(`Approval needed first. Approve ${quote.fromToken.symbol} for spender ${quote.approvalAddress}`);
+    }
+    console.error(`[clara] Executing bridge: ${quote.fromAmount} ${quote.fromToken.symbol} (${quote.fromChain}) → ${quote.toToken.symbol} (${quote.toChain})`);
+    const txReq = quote.transactionRequest;
+    // Sign the transaction
+    const signed = await signTransaction({
+        to: txReq.to,
+        value: txReq.value ? BigInt(txReq.value).toString() : "0",
+        data: txReq.data,
+        gasLimit: txReq.gasLimit,
+        chainId: CHAIN_CONFIG[quote.fromChain].chainId,
+    }, quote.fromChain);
+    // Broadcast via RPC
+    const config = CHAIN_CONFIG[quote.fromChain];
+    const response = await fetch(config.rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "eth_sendRawTransaction",
+            params: [signed.signedTx],
+            id: 1,
+        }),
+    });
+    const result = await response.json();
+    if (result.error) {
+        throw new Error(`Bridge failed: ${result.error.message}`);
+    }
+    // Calculate estimated arrival time
+    const arrivalTime = new Date(Date.now() + quote.estimatedTime * 1000);
+    const estimatedArrival = arrivalTime.toLocaleTimeString();
+    return {
+        txHash: result.result || "",
+        status: "pending",
+        estimatedArrival,
+    };
+}
+/**
+ * Get the status of a bridge transaction
+ * Uses Li.Fi's status endpoint to track cross-chain transfers
+ *
+ * @param txHash - Source chain transaction hash
+ * @param fromChain - Source chain
+ * @param toChain - Destination chain
+ * @returns Bridge status object
+ */
+export async function getBridgeStatus(txHash, fromChain, toChain) {
+    const fromConfig = CHAIN_CONFIG[fromChain];
+    const toConfig = CHAIN_CONFIG[toChain];
+    if (!fromConfig?.chainId || !toConfig?.chainId) {
+        throw new Error(`Unsupported chain: ${fromChain} or ${toChain}`);
+    }
+    const params = new URLSearchParams({
+        txHash,
+        fromChain: fromConfig.chainId.toString(),
+        toChain: toConfig.chainId.toString(),
+    });
+    const response = await fetch(`${LIFI_API}/status?${params}`);
+    if (!response.ok) {
+        if (response.status === 404) {
+            return { status: "NOT_FOUND" };
+        }
+        throw new Error(`Failed to get bridge status: ${response.status}`);
+    }
+    const data = await response.json();
+    return {
+        status: data.status,
+        substatus: data.substatus,
+        sending: data.sending,
+        receiving: data.receiving,
+        tool: data.tool,
+    };
+}
+/**
+ * Wait for a bridge to complete with polling
+ * Returns when the bridge is complete or timeout is reached
+ *
+ * @param txHash - Source chain transaction hash
+ * @param fromChain - Source chain
+ * @param toChain - Destination chain
+ * @param options - Polling options
+ * @returns Final bridge status
+ */
+export async function waitForBridge(txHash, fromChain, toChain, options = {}) {
+    const pollInterval = options.pollIntervalMs || 15000; // 15 seconds
+    const timeout = options.timeoutMs || 10 * 60 * 1000; // 10 minutes
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeout) {
+        const status = await getBridgeStatus(txHash, fromChain, toChain);
+        if (options.onUpdate) {
+            options.onUpdate(status);
+        }
+        if (status.status === "DONE" || status.status === "FAILED") {
+            return status;
+        }
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+    }
+    return { status: "PENDING", substatus: "TIMEOUT" };
 }
 /**
  * Execute a swap using the quote's transaction request
@@ -1747,11 +3122,33 @@ export async function executeSwap(quote, chain) {
         throw new Error(`Approval needed first. Approve ${quote.fromToken.symbol} for spender ${quote.approvalAddress}`);
     }
     console.error(`[clara] Executing swap: ${quote.fromAmount} ${quote.fromToken.symbol} → ${quote.toToken.symbol}`);
-    // Send the swap transaction
-    const result = await sendTransaction(quote.transactionRequest.to, "0", // Value is in the tx data
-    chain, undefined, quote.transactionRequest.data);
+    const txReq = quote.transactionRequest;
+    // Sign the transaction with the full parameters from the quote
+    const signed = await signTransaction({
+        to: txReq.to,
+        value: txReq.value ? BigInt(txReq.value).toString() : "0",
+        data: txReq.data,
+        gasLimit: txReq.gasLimit, // Use gas limit from quote
+        chainId: CHAIN_CONFIG[chain].chainId,
+    }, chain);
+    // Broadcast via RPC
+    const config = CHAIN_CONFIG[chain];
+    const response = await fetch(config.rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "eth_sendRawTransaction",
+            params: [signed.signedTx],
+            id: 1,
+        }),
+    });
+    const rpcResult = (await response.json());
+    if (rpcResult.error) {
+        throw new Error(`Swap failed: ${rpcResult.error.message}`);
+    }
     return {
-        txHash: result.txHash,
+        txHash: rpcResult.result || "",
         status: "pending",
     };
 }
@@ -1778,6 +3175,28 @@ export function getSwappableTokens(chain) {
 // ============================================================================
 // DeFiLlama Yields API (free, no API key)
 const DEFILLAMA_YIELDS_API = "https://yields.llama.fi";
+let defiLlamaPoolsCache = null;
+const DEFILLAMA_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+async function getDefiLlamaPools() {
+    // Return cached data if fresh
+    if (defiLlamaPoolsCache && Date.now() - defiLlamaPoolsCache.timestamp < DEFILLAMA_CACHE_TTL_MS) {
+        console.error(`[clara] Using cached DeFiLlama pools data`);
+        return defiLlamaPoolsCache.data;
+    }
+    console.error(`[clara] Fetching DeFiLlama pools (this may take a moment)...`);
+    const response = await fetch(`${DEFILLAMA_YIELDS_API}/pools`);
+    if (!response.ok) {
+        throw new Error(`DeFiLlama API error: ${response.status}`);
+    }
+    const result = await response.json();
+    // Cache the result
+    defiLlamaPoolsCache = {
+        data: result.data,
+        timestamp: Date.now(),
+    };
+    console.error(`[clara] Cached ${result.data.length} pools from DeFiLlama`);
+    return result.data;
+}
 // Aave v3 Pool addresses per chain
 const AAVE_V3_POOLS = {
     ethereum: {
@@ -1812,19 +3231,18 @@ const AAVE_SELECTORS = {
  */
 export async function getYieldOpportunities(asset, options = {}) {
     const { chains = ["base", "arbitrum"], minTvl = 1_000_000, // $1M minimum TVL for safety
-    protocols = ["aave-v3"], // Start conservative
+    protocols = ["aave-v3", "compound-v3", "morpho-v1"], // Support major protocols
      } = options;
     console.error(`[clara] Fetching yields for ${asset} on ${chains.join(", ")}`);
     try {
-        const response = await fetch(`${DEFILLAMA_YIELDS_API}/pools`);
-        if (!response.ok) {
-            throw new Error(`DeFiLlama API error: ${response.status}`);
-        }
-        const data = (await response.json());
+        // Use cached DeFiLlama pools data
+        const pools = await getDefiLlamaPools();
         // Filter for matching opportunities
         const assetUpper = asset.toUpperCase();
         const opportunities = [];
-        for (const pool of data.data) {
+        for (const pool of pools) {
+            // Type assertion for additional fields
+            const poolData = pool;
             // Check chain
             const chainLower = pool.chain.toLowerCase();
             if (!chains.includes(chainLower))
@@ -1847,8 +3265,8 @@ export async function getYieldOpportunities(asset, options = {}) {
                 apyReward: pool.apyReward,
                 apyTotal: pool.apy || 0,
                 tvlUsd: pool.tvlUsd,
-                stablecoin: pool.stablecoin,
-                underlyingTokens: pool.underlyingTokens || [],
+                stablecoin: poolData.stablecoin || false,
+                underlyingTokens: poolData.underlyingTokens || [],
             });
         }
         // Sort by total APY descending
@@ -1869,14 +3287,49 @@ export async function getBestYield(asset, chains = ["base", "arbitrum"]) {
     return opportunities[0] || null;
 }
 /**
+ * Parse a decimal amount string to BigInt with the specified decimals.
+ * Handles arbitrary precision without floating-point errors.
+ *
+ * Examples:
+ *   parseAmountToBigInt("100", 6)      -> 100000000n (100 USDC)
+ *   parseAmountToBigInt("0.01", 6)     -> 10000n (0.01 USDC)
+ *   parseAmountToBigInt("1000000", 18) -> 1000000000000000000000000n (1M DAI, precise)
+ */
+export function parseAmountToBigInt(amount, decimals) {
+    // Handle edge cases
+    if (!amount || amount === "0")
+        return BigInt(0);
+    // Remove any whitespace and handle negative (shouldn't happen but be safe)
+    const cleanAmount = amount.trim();
+    if (cleanAmount.startsWith("-")) {
+        throw new Error("Negative amounts not supported");
+    }
+    // Split into whole and fractional parts
+    const parts = cleanAmount.split(".");
+    const wholePart = parts[0] || "0";
+    const fracPart = parts[1] || "";
+    // Validate: only digits allowed
+    if (!/^\d+$/.test(wholePart) || (fracPart && !/^\d+$/.test(fracPart))) {
+        throw new Error(`Invalid amount format: ${amount}`);
+    }
+    // Pad or truncate fractional part to match decimals
+    // If fracPart is longer than decimals, we truncate (floor behavior)
+    const paddedFrac = fracPart.padEnd(decimals, "0").slice(0, decimals);
+    // Combine: wholePart + paddedFrac gives us the raw amount
+    const rawString = wholePart + paddedFrac;
+    // Remove leading zeros (but keep at least one digit)
+    const trimmed = rawString.replace(/^0+/, "") || "0";
+    return BigInt(trimmed);
+}
+/**
  * Encode Aave v3 supply transaction
  * supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode)
  */
 export function encodeAaveSupply(assetAddress, amount, decimals, onBehalfOf) {
     // Pad asset address (32 bytes)
     const paddedAsset = assetAddress.slice(2).toLowerCase().padStart(64, "0");
-    // Pad amount (32 bytes)
-    const amountRaw = BigInt(Math.floor(parseFloat(amount) * Math.pow(10, decimals)));
+    // Pad amount (32 bytes) - using precise BigInt parsing
+    const amountRaw = parseAmountToBigInt(amount, decimals);
     const paddedAmount = amountRaw.toString(16).padStart(64, "0");
     // Pad onBehalfOf address (32 bytes)
     const paddedOnBehalfOf = onBehalfOf.slice(2).toLowerCase().padStart(64, "0");
@@ -1896,7 +3349,8 @@ export function encodeAaveWithdraw(assetAddress, amount, decimals, to) {
         paddedAmount = MAX_UINT256.toString(16).padStart(64, "0");
     }
     else {
-        const amountRaw = BigInt(Math.floor(parseFloat(amount) * Math.pow(10, decimals)));
+        // Use precise BigInt parsing
+        const amountRaw = parseAmountToBigInt(amount, decimals);
         paddedAmount = amountRaw.toString(16).padStart(64, "0");
     }
     const paddedTo = to.slice(2).toLowerCase().padStart(64, "0");
@@ -1904,66 +3358,121 @@ export function encodeAaveWithdraw(assetAddress, amount, decimals, to) {
 }
 /**
  * Create a yield deposit plan for the best available opportunity
+ * Falls back to next-best option if the highest-APY adapter fails
  */
 export async function createYieldPlan(asset, amount, preferredChains = ["base", "arbitrum"]) {
     const session = await getSession();
     if (!session?.authenticated || !session.address) {
         throw new Error("Not authenticated");
     }
-    // Find best yield opportunity
-    const best = await getBestYield(asset, preferredChains);
-    if (!best) {
+    // Get all opportunities sorted by APY
+    const opportunities = await getYieldOpportunities(asset, { chains: preferredChains });
+    if (opportunities.length === 0) {
         return null;
     }
-    // Only support Aave v3 for now
-    if (best.protocol !== "aave-v3") {
-        console.error(`[clara] Unsupported protocol: ${best.protocol}`);
+    // Try each opportunity until one works
+    for (const opp of opportunities) {
+        try {
+            const plan = await tryCreatePlanForOpportunity(opp, asset, amount, session.address);
+            if (plan) {
+                return plan;
+            }
+        }
+        catch (error) {
+            console.error(`[clara] Skipping ${opp.protocol} on ${opp.chain}: ${error instanceof Error ? error.message : "unknown error"}`);
+            continue;
+        }
+    }
+    return null;
+}
+/**
+ * Try to create a plan for a specific opportunity
+ * Returns null if the adapter can't handle this opportunity
+ */
+async function tryCreatePlanForOpportunity(opp, asset, amount, userAddress) {
+    // Get the protocol adapter
+    const adapter = getProtocolAdapter(opp.protocol);
+    if (!adapter) {
+        console.error(`[clara] Unsupported protocol: ${opp.protocol}`);
         return null;
     }
-    const aaveConfig = AAVE_V3_POOLS[best.chain];
-    if (!aaveConfig) {
-        console.error(`[clara] Aave not configured for ${best.chain}`);
+    // Verify chain is supported by this adapter
+    if (!adapter.supportedChains.includes(opp.chain)) {
+        console.error(`[clara] ${adapter.displayName} not available on ${opp.chain}`);
         return null;
     }
     // Get asset address on this chain
-    const tokenInfo = resolveToken(asset, best.chain);
+    const tokenInfo = resolveToken(asset, opp.chain);
     if (!tokenInfo) {
-        console.error(`[clara] Token ${asset} not found on ${best.chain}`);
+        console.error(`[clara] Token ${asset} not found on ${opp.chain}`);
         return null;
     }
+    // Encode the supply transaction using the adapter
+    // Pass the pool symbol (e.g., "HYPERUSDC") for vault-based protocols like Morpho
+    const encoded = adapter.encodeSupply({
+        assetAddress: tokenInfo.address,
+        amount,
+        decimals: tokenInfo.decimals,
+        onBehalfOf: userAddress,
+        chain: opp.chain,
+        poolSymbol: opp.symbol, // DeFiLlama pool symbol for vault lookup
+    });
+    // Use the target contract from encoded tx for approval check
+    // This ensures we check approval against the actual vault address
+    const poolAddress = encoded.to;
     // Check if approval is needed
-    const approval = await getAllowance(tokenInfo.address, aaveConfig.pool, best.chain);
-    const amountRaw = BigInt(Math.floor(parseFloat(amount) * Math.pow(10, tokenInfo.decimals)));
+    const approval = await getAllowance(tokenInfo.address, poolAddress, opp.chain);
+    const amountRaw = parseAmountToBigInt(amount, tokenInfo.decimals);
     const needsApproval = BigInt(approval.allowanceRaw) < amountRaw;
-    // Encode the supply transaction
-    const transactionData = encodeAaveSupply(tokenInfo.address, amount, tokenInfo.decimals, session.address);
     return {
         action: "deposit",
-        protocol: "Aave v3",
-        chain: best.chain,
+        protocol: adapter.displayName,
+        chain: opp.chain,
         asset: tokenInfo.symbol,
         assetAddress: tokenInfo.address,
         amount,
-        amountRaw: amountRaw.toString(),
-        apy: best.apyTotal,
-        tvlUsd: best.tvlUsd,
-        poolContract: aaveConfig.pool,
-        transactionData,
+        amountRaw: encoded.amountRaw,
+        apy: opp.apyTotal,
+        tvlUsd: opp.tvlUsd,
+        poolContract: encoded.to,
+        transactionData: encoded.data,
         needsApproval,
-        approvalAddress: needsApproval ? aaveConfig.pool : undefined,
+        approvalAddress: needsApproval ? encoded.to : undefined,
         estimatedGasUsd: "0.50", // Rough estimate
     };
 }
 /**
  * Execute a yield deposit
+ * Records the transaction for earnings tracking
  */
 export async function executeYieldDeposit(plan) {
     if (plan.needsApproval) {
         throw new Error("Approval needed first");
     }
+    const session = await getSession();
+    if (!session?.authenticated || !session.address) {
+        throw new Error("Not authenticated");
+    }
     console.error(`[clara] Executing yield deposit: ${plan.amount} ${plan.asset} → ${plan.protocol} on ${plan.chain}`);
     const result = await sendTransaction(plan.poolContract, "0", // No ETH value for ERC-20 supply
     plan.chain, undefined, plan.transactionData);
+    // Record transaction for earnings tracking
+    try {
+        await recordYieldTransaction(session.address, {
+            action: "deposit",
+            protocol: plan.protocol.toLowerCase().replace(/\s+/g, "-"), // "Aave v3" -> "aave-v3"
+            chain: plan.chain,
+            asset: plan.asset,
+            amount: plan.amount,
+            amountRaw: plan.amountRaw,
+            txHash: result.txHash,
+        });
+        console.error(`[clara] Recorded deposit transaction for earnings tracking`);
+    }
+    catch (error) {
+        console.error(`[clara] Failed to record deposit transaction:`, error);
+        // Don't fail the deposit if recording fails
+    }
     return {
         txHash: result.txHash,
         status: "pending",
@@ -1986,67 +3495,158 @@ const AAVE_ATOKENS = {
     },
 };
 /**
- * Get user's yield positions across chains
+ * Get user's yield positions across chains and protocols
+ * Now supports Aave V3 and Compound V3 via adapter pattern
+ * Includes USD valuation via price oracle
  */
-export async function getYieldPositions(chains = ["base", "arbitrum"]) {
+export async function getYieldPositions(chains = ["base", "arbitrum"], protocols = ["aave-v3", "compound-v3"]) {
     const session = await getSession();
     if (!session?.authenticated || !session.address) {
         throw new Error("Not authenticated");
     }
-    const positions = [];
-    for (const chain of chains) {
-        const aTokens = AAVE_ATOKENS[chain];
-        if (!aTokens)
+    console.error(`[clara] Checking yield positions (parallelized)...`);
+    const startTime = Date.now();
+    const balanceCheckTasks = [];
+    for (const protocolId of protocols) {
+        const adapter = getProtocolAdapter(protocolId);
+        if (!adapter)
             continue;
-        const aaveConfig = AAVE_V3_POOLS[chain];
-        if (!aaveConfig)
-            continue;
-        // Check balance of each aToken
-        for (const [symbol, aTokenAddress] of Object.entries(aTokens)) {
-            if (aTokenAddress === "0x0000000000000000000000000000000000000000")
+        for (const chain of chains) {
+            if (!adapter.supportedChains.includes(chain))
                 continue;
-            try {
-                const balance = await getTokenBalance(aTokenAddress, chain, session.address);
-                const balanceNum = parseFloat(balance.balance);
-                if (balanceNum > 0.0001) { // Only show positions above dust
-                    // Get underlying token address
-                    const underlying = resolveToken(symbol, chain);
-                    // Get current APY from DeFiLlama
-                    const yields = await getYieldOpportunities(symbol, { chains: [chain] });
-                    const currentApy = yields[0]?.apyTotal || 0;
-                    positions.push({
-                        protocol: "Aave v3",
-                        chain,
-                        asset: symbol,
-                        assetAddress: underlying?.address || "",
-                        aTokenAddress,
-                        deposited: balance.balance,
-                        depositedRaw: balance.balanceRaw,
-                        currentApy,
-                        valueUsd: "—", // Would need price oracle
-                    });
+            const assetsToCheck = getAssetsForProtocol(protocolId, chain);
+            for (const symbol of assetsToCheck) {
+                const receiptToken = adapter.getReceiptToken(symbol, chain);
+                if (!receiptToken || receiptToken === "0x0000000000000000000000000000000000000000") {
+                    continue;
                 }
-            }
-            catch (error) {
-                console.error(`[clara] Error checking aToken ${symbol} on ${chain}:`, error);
-                continue;
+                balanceCheckTasks.push({
+                    protocolId,
+                    protocolName: adapter.displayName,
+                    chain,
+                    symbol,
+                    receiptToken,
+                });
             }
         }
     }
+    console.error(`[clara] Checking ${balanceCheckTasks.length} receipt token balances in parallel...`);
+    // Step 2: Run ALL balance checks in parallel
+    const balanceResults = await Promise.all(balanceCheckTasks.map(async (task) => {
+        try {
+            const balance = await getTokenBalance(task.receiptToken, task.chain, session.address);
+            return { ...task, balance, error: null };
+        }
+        catch (error) {
+            return { ...task, balance: null, error };
+        }
+    }));
+    // Step 3: Filter to non-zero balances
+    const nonZeroPositions = balanceResults.filter((r) => {
+        if (r.error || !r.balance)
+            return false;
+        const balanceNum = parseFloat(r.balance.balance);
+        return balanceNum > 0.0001; // Above dust threshold
+    });
+    console.error(`[clara] Found ${nonZeroPositions.length} positions with balances`);
+    if (nonZeroPositions.length === 0) {
+        console.error(`[clara] Position check completed in ${Date.now() - startTime}ms`);
+        return [];
+    }
+    // Step 4: Fetch APYs for positions with balances (in parallel)
+    const positionsWithApy = await Promise.all(nonZeroPositions.map(async (pos) => {
+        try {
+            const yields = await getYieldOpportunities(pos.symbol, {
+                chains: [pos.chain],
+                protocols: [pos.protocolId],
+            });
+            return { ...pos, currentApy: yields[0]?.apyTotal || 0 };
+        }
+        catch {
+            return { ...pos, currentApy: 0 };
+        }
+    }));
+    // Step 5: Batch fetch prices for all position symbols
+    const symbols = [...new Set(positionsWithApy.map((p) => p.symbol))];
+    const prices = await getTokenPricesUsd(symbols);
+    // Step 6: Build final positions with USD values
+    const positions = positionsWithApy.map((pos) => {
+        const underlying = resolveToken(pos.symbol, pos.chain);
+        const price = prices[pos.symbol];
+        const balanceNum = parseFloat(pos.balance.balance);
+        const valueUsd = price !== undefined ? (balanceNum * price).toFixed(2) : "—";
+        return {
+            protocol: pos.protocolName,
+            chain: pos.chain,
+            asset: pos.symbol,
+            assetAddress: underlying?.address || "",
+            aTokenAddress: pos.receiptToken,
+            deposited: pos.balance.balance,
+            depositedRaw: pos.balance.balanceRaw,
+            currentApy: pos.currentApy,
+            valueUsd,
+        };
+    });
+    console.error(`[clara] Position check completed in ${Date.now() - startTime}ms`);
     return positions;
 }
 /**
+ * Get the list of assets to check for a protocol on a chain
+ * This is needed because each protocol supports different assets
+ */
+function getAssetsForProtocol(protocolId, chain) {
+    // Common stablecoins and assets across protocols
+    const commonAssets = ["USDC", "USDT", "DAI", "WETH"];
+    // Protocol-specific additions
+    if (protocolId === "aave-v3") {
+        if (chain === "base")
+            return ["USDC", "USDbC", "WETH"];
+        if (chain === "arbitrum")
+            return ["USDC", "USDC.e", "USDT", "DAI", "WETH"];
+        return commonAssets;
+    }
+    if (protocolId === "compound-v3") {
+        // Compound V3 has specific Comet markets
+        if (chain === "base")
+            return ["USDC", "USDbC", "WETH"];
+        if (chain === "arbitrum")
+            return ["USDC", "USDC.e", "WETH"];
+        if (chain === "ethereum")
+            return ["USDC", "WETH"];
+        if (chain === "polygon")
+            return ["USDC"];
+        if (chain === "optimism")
+            return ["USDC", "WETH"];
+        return ["USDC"];
+    }
+    return commonAssets;
+}
+/**
  * Create a withdrawal plan for yield positions
+ * Now supports multiple protocols via adapter pattern
  */
 export async function createWithdrawPlan(asset, amount, // "all" or specific amount
-chain) {
+chain, protocol = "aave-v3" // Default to Aave for backwards compatibility
+) {
     const session = await getSession();
     if (!session?.authenticated || !session.address) {
         throw new Error("Not authenticated");
     }
-    const aaveConfig = AAVE_V3_POOLS[chain];
-    if (!aaveConfig) {
-        console.error(`[clara] Aave not configured for ${chain}`);
+    // Get the protocol adapter
+    const adapter = getProtocolAdapter(protocol);
+    if (!adapter) {
+        console.error(`[clara] Unsupported protocol: ${protocol}`);
+        return null;
+    }
+    // Verify chain support
+    if (!adapter.supportedChains.includes(chain)) {
+        console.error(`[clara] ${adapter.displayName} not available on ${chain}`);
+        return null;
+    }
+    // Get pool address
+    const poolAddress = adapter.getPoolAddress(chain);
+    if (!poolAddress) {
+        console.error(`[clara] ${adapter.displayName} not configured for ${chain}`);
         return null;
     }
     // Get token info
@@ -2055,59 +3655,85 @@ chain) {
         console.error(`[clara] Token ${asset} not found on ${chain}`);
         return null;
     }
-    // Get aToken address
-    const aTokens = AAVE_ATOKENS[chain];
-    const aTokenAddress = aTokens?.[tokenInfo.symbol];
-    if (!aTokenAddress || aTokenAddress === "0x0000000000000000000000000000000000000000") {
-        console.error(`[clara] No aToken for ${asset} on ${chain}`);
+    // Get receipt token address (aToken for Aave, Comet for Compound)
+    const receiptTokenAddress = adapter.getReceiptToken(tokenInfo.symbol, chain);
+    if (!receiptTokenAddress || receiptTokenAddress === "0x0000000000000000000000000000000000000000") {
+        console.error(`[clara] No receipt token for ${asset} on ${chain} in ${adapter.displayName}`);
         return null;
     }
     // Check deposited balance
-    const aTokenBalance = await getTokenBalance(aTokenAddress, chain, session.address);
-    const depositedNum = parseFloat(aTokenBalance.balance);
+    const receiptBalance = await getTokenBalance(receiptTokenAddress, chain, session.address);
+    const depositedNum = parseFloat(receiptBalance.balance);
     if (depositedNum < 0.0001) {
-        console.error(`[clara] No ${asset} deposited in Aave on ${chain}`);
+        console.error(`[clara] No ${asset} deposited in ${adapter.displayName} on ${chain}`);
         return null;
     }
     // Determine withdrawal amount
     const isWithdrawAll = amount === "all" || amount === "max";
-    const withdrawAmount = isWithdrawAll ? aTokenBalance.balance : amount;
+    const withdrawAmount = isWithdrawAll ? receiptBalance.balance : amount;
     const withdrawNum = parseFloat(withdrawAmount);
     if (withdrawNum > depositedNum) {
-        console.error(`[clara] Cannot withdraw ${withdrawAmount}, only ${aTokenBalance.balance} deposited`);
+        console.error(`[clara] Cannot withdraw ${withdrawAmount}, only ${receiptBalance.balance} deposited`);
         return null;
     }
     // Get current APY for display
-    const yields = await getYieldOpportunities(asset, { chains: [chain] });
+    const yields = await getYieldOpportunities(asset, { chains: [chain], protocols: [protocol] });
     const currentApy = yields[0]?.apyTotal || 0;
     const tvlUsd = yields[0]?.tvlUsd || 0;
-    // Encode withdraw transaction
-    const transactionData = encodeAaveWithdraw(tokenInfo.address, isWithdrawAll ? "max" : withdrawAmount, tokenInfo.decimals, session.address);
+    // Encode withdraw transaction using adapter
+    const encoded = adapter.encodeWithdraw({
+        assetAddress: tokenInfo.address,
+        amount: isWithdrawAll ? "max" : withdrawAmount,
+        decimals: tokenInfo.decimals,
+        to: session.address,
+        chain,
+    });
     return {
         action: "withdraw",
-        protocol: "Aave v3",
+        protocol: adapter.displayName,
         chain,
         asset: tokenInfo.symbol,
         assetAddress: tokenInfo.address,
         amount: withdrawAmount,
-        amountRaw: isWithdrawAll ? aTokenBalance.balanceRaw : BigInt(Math.floor(withdrawNum * Math.pow(10, tokenInfo.decimals))).toString(),
+        amountRaw: encoded.amountRaw,
         apy: currentApy,
         tvlUsd,
-        poolContract: aaveConfig.pool,
-        transactionData,
+        poolContract: encoded.to,
+        transactionData: encoded.data,
         needsApproval: false, // No approval needed for withdraws
         estimatedGasUsd: "0.30",
     };
 }
 /**
  * Execute a yield withdrawal
+ * Records the transaction for earnings tracking
  */
 export async function executeYieldWithdraw(plan) {
     if (plan.action !== "withdraw") {
         throw new Error("Invalid plan - not a withdraw action");
     }
+    const session = await getSession();
+    if (!session?.authenticated || !session.address) {
+        throw new Error("Not authenticated");
+    }
     console.error(`[clara] Executing yield withdraw: ${plan.amount} ${plan.asset} from ${plan.protocol} on ${plan.chain}`);
     const result = await sendTransaction(plan.poolContract, "0", plan.chain, undefined, plan.transactionData);
+    // Record transaction for earnings tracking
+    try {
+        await recordYieldTransaction(session.address, {
+            action: "withdraw",
+            protocol: plan.protocol.toLowerCase().replace(/\s+/g, "-"),
+            chain: plan.chain,
+            asset: plan.asset,
+            amount: plan.amount,
+            amountRaw: plan.amountRaw,
+            txHash: result.txHash,
+        });
+        console.error(`[clara] Recorded withdrawal transaction for earnings tracking`);
+    }
+    catch (error) {
+        console.error(`[clara] Failed to record withdrawal transaction:`, error);
+    }
     return {
         txHash: result.txHash,
         status: "pending",
@@ -2121,5 +3747,591 @@ export function formatYieldOpportunity(opp) {
     const tvlStr = (opp.tvlUsd / 1_000_000).toFixed(1);
     return `${opp.protocol} on ${opp.chain}: ${apyStr}% APY ($${tvlStr}M TVL)`;
 }
+/**
+ * Get earnings for a specific yield position
+ */
+export async function getYieldEarnings(asset, chain, protocol = "aave-v3") {
+    const session = await getSession();
+    if (!session?.authenticated || !session.address) {
+        throw new Error("Not authenticated");
+    }
+    // Get current position
+    const positions = await getYieldPositions([chain]);
+    const position = positions.find((p) => p.asset.toUpperCase() === asset.toUpperCase() &&
+        p.chain === chain &&
+        p.protocol.toLowerCase().replace(/\s+/g, "-") === protocol.toLowerCase());
+    if (!position) {
+        return null;
+    }
+    // Get transaction history
+    const transactions = await getTransactionsForPosition(session.address, asset, chain, protocol);
+    const currentBalance = parseFloat(position.deposited);
+    const earnings = calculateEarnings(transactions, currentBalance);
+    // Get USD price for earnings
+    const price = await getTokenPriceUsd(asset);
+    const earnedYieldUsd = price !== null
+        ? (earnings.earnedYield * price).toFixed(2)
+        : "—";
+    return {
+        asset: position.asset,
+        chain: position.chain,
+        protocol: position.protocol,
+        totalDeposited: earnings.netDeposited >= 0
+            ? (earnings.netDeposited + Math.max(0, -earnings.earnedYield)).toFixed(6)
+            : "0",
+        totalWithdrawn: "0", // Simplified for now
+        netDeposited: earnings.netDeposited.toFixed(6),
+        currentBalance: position.deposited,
+        earnedYield: earnings.earnedYield.toFixed(6),
+        earnedYieldUsd,
+        earnedYieldPercent: earnings.earnedYieldPercent.toFixed(2),
+        periodDays: Math.floor(earnings.periodDays),
+        effectiveApy: earnings.effectiveApy !== null
+            ? earnings.effectiveApy.toFixed(2)
+            : null,
+    };
+}
+/**
+ * Get earnings summary for all positions
+ */
+export async function getAllYieldEarnings() {
+    const session = await getSession();
+    if (!session?.authenticated || !session.address) {
+        throw new Error("Not authenticated");
+    }
+    // Get all current positions
+    const positions = await getYieldPositions();
+    const earningsPromises = positions.map((pos) => getYieldEarnings(pos.asset, pos.chain, pos.protocol));
+    const allEarnings = await Promise.all(earningsPromises);
+    const validEarnings = allEarnings.filter((e) => e !== null);
+    // Calculate total earned USD
+    let totalEarned = 0;
+    for (const e of validEarnings) {
+        const usd = parseFloat(e.earnedYieldUsd);
+        if (!isNaN(usd)) {
+            totalEarned += usd;
+        }
+    }
+    return {
+        positions: validEarnings,
+        totalEarnedUsd: totalEarned.toFixed(2),
+    };
+}
+export { recordYieldTransaction, getTransactionsForPosition, calculateEarnings, getYieldEarningsSummary, };
 export { CHAIN_CONFIG, EXPLORER_CONFIG, NATIVE_TOKEN_ADDRESS, AAVE_V3_POOLS };
+// Re-export protocol adapter utilities
+export { getProtocolAdapter, getSupportedProtocols };
+/**
+ * Get complete dashboard data for the /clara command
+ * Gathers portfolio, yield positions, approvals, and activity in parallel
+ */
+export async function getClaraDashboard() {
+    const session = await getSession();
+    if (!session?.authenticated || !session.address) {
+        return { authenticated: false };
+    }
+    const address = session.address;
+    const shortAddress = `${address.slice(0, 6)}...${address.slice(-4)}`;
+    // Gather data in parallel for speed
+    const [portfolioData, yieldData, earningsData] = await Promise.all([
+        getPortfolioData(address),
+        getYieldPositions(["base", "arbitrum"]).catch(() => []),
+        getAllYieldEarnings().catch(() => ({ positions: [], totalEarnedUsd: "0" })),
+    ]);
+    // Build portfolio section
+    const portfolio = portfolioData ? {
+        totalValueUsd: portfolioData.totalValueUsd,
+        chains: portfolioData.chains,
+    } : undefined;
+    // Build yield positions section
+    let yieldPositions = undefined;
+    if (yieldData && yieldData.length > 0) {
+        const positions = yieldData.map(p => ({
+            protocol: p.protocol,
+            chain: p.chain,
+            asset: p.asset,
+            deposited: p.deposited,
+            valueUsd: p.valueUsd,
+            apy: p.currentApy,
+        }));
+        // Calculate weighted APY
+        let totalValue = 0;
+        let weightedApySum = 0;
+        for (const p of positions) {
+            const value = parseFloat(p.valueUsd) || 0;
+            totalValue += value;
+            weightedApySum += value * p.apy;
+        }
+        const weightedApy = totalValue > 0 ? weightedApySum / totalValue : 0;
+        yieldPositions = {
+            positions,
+            totalValueUsd: totalValue.toFixed(2),
+            weightedApy: Math.round(weightedApy * 100) / 100,
+            lifetimeEarnings: earningsData.totalEarnedUsd,
+        };
+    }
+    return {
+        authenticated: true,
+        wallet: { address, shortAddress },
+        portfolio,
+        yieldPositions,
+        pendingApprovals: [], // Would need to implement approval scanning
+        recentActivity: [], // Would need to implement activity fetching
+    };
+}
+/**
+ * Helper to get portfolio data across chains
+ */
+async function getPortfolioData(address) {
+    const chains = ["base", "arbitrum", "ethereum"];
+    const chainData = [];
+    let totalValue = 0;
+    for (const chain of chains) {
+        try {
+            // Get native balance
+            const nativeBalance = await getNativeBalance(chain);
+            const nativeNum = parseFloat(nativeBalance.balance);
+            // Get ETH price
+            const ethPrice = await getTokenPriceUsd("ETH");
+            const nativeValueUsd = ethPrice ? (nativeNum * ethPrice).toFixed(2) : "0";
+            totalValue += parseFloat(nativeValueUsd);
+            // Get major token balances
+            const tokens = [];
+            const tokensToCheck = ["USDC", "USDT", "DAI"];
+            for (const symbol of tokensToCheck) {
+                const tokenInfo = resolveToken(symbol, chain);
+                if (tokenInfo) {
+                    try {
+                        const balance = await getTokenBalance(tokenInfo.address, chain, address);
+                        const balanceNum = parseFloat(balance.balance);
+                        if (balanceNum > 0.01) {
+                            const price = await getTokenPriceUsd(symbol);
+                            const valueUsd = price ? (balanceNum * price).toFixed(2) : "0";
+                            totalValue += parseFloat(valueUsd);
+                            tokens.push({ symbol, balance: balance.balance, valueUsd });
+                        }
+                    }
+                    catch {
+                        // Token not found or error, skip
+                    }
+                }
+            }
+            if (nativeNum > 0.0001 || tokens.length > 0) {
+                chainData.push({
+                    chain,
+                    nativeBalance: nativeBalance.balance,
+                    nativeValueUsd,
+                    tokens,
+                });
+            }
+        }
+        catch (error) {
+            console.error(`[clara] Error fetching portfolio for ${chain}:`, error);
+        }
+    }
+    if (chainData.length === 0) {
+        return null;
+    }
+    return {
+        totalValueUsd: totalValue.toFixed(2),
+        chains: chainData,
+    };
+}
+/**
+ * Format the dashboard as ASCII art
+ */
+export function formatClaraDashboard(dashboard) {
+    if (!dashboard.authenticated) {
+        return `
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│      ██████╗██╗      █████╗ ██████╗  █████╗                     │
+│     ██╔════╝██║     ██╔══██╗██╔══██╗██╔══██╗                    │
+│     ██║     ██║     ███████║██████╔╝███████║                    │
+│     ██║     ██║     ██╔══██║██╔══██╗██╔══██║                    │
+│     ╚██████╗███████╗██║  ██║██║  ██║██║  ██║                    │
+│      ╚═════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝                    │
+│                                                                 │
+│              Your AI-powered DeFi companion                     │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ⚠️  Wallet not connected                                       │
+│                                                                 │
+│   Get started by saying:                                        │
+│   → "Set up my wallet"                                          │
+│   → "Create a wallet with my email"                             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘`;
+    }
+    const lines = [];
+    // Header
+    lines.push(`┌─────────────────────────────────────────────────────────────────┐`);
+    lines.push(`│                                                                 │`);
+    lines.push(`│      ██████╗██╗      █████╗ ██████╗  █████╗                     │`);
+    lines.push(`│     ██╔════╝██║     ██╔══██╗██╔══██╗██╔══██╗                    │`);
+    lines.push(`│     ██║     ██║     ███████║██████╔╝███████║                    │`);
+    lines.push(`│     ██║     ██║     ██╔══██║██╔══██╗██╔══██║                    │`);
+    lines.push(`│     ╚██████╗███████╗██║  ██║██║  ██║██║  ██║                    │`);
+    lines.push(`│      ╚═════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝                    │`);
+    lines.push(`│                                                                 │`);
+    lines.push(`│              Your AI-powered DeFi companion                     │`);
+    lines.push(`│                                                                 │`);
+    lines.push(`├─────────────────────────────────────────────────────────────────┤`);
+    // Wallet address
+    if (dashboard.wallet) {
+        lines.push(`│  WALLET                                                         │`);
+        lines.push(`│  ${dashboard.wallet.shortAddress.padEnd(61)}│`);
+        lines.push(`├─────────────────────────────────────────────────────────────────┤`);
+    }
+    // Total balance
+    if (dashboard.portfolio) {
+        lines.push(`│                                                                 │`);
+        lines.push(`│  💰 TOTAL BALANCE                                               │`);
+        const balanceStr = `$${dashboard.portfolio.totalValueUsd}`;
+        const padding = Math.floor((55 - balanceStr.length) / 2);
+        lines.push(`│  ┌───────────────────────────────────────────────────────────┐  │`);
+        lines.push(`│  │${' '.repeat(padding)}${balanceStr}${' '.repeat(55 - padding - balanceStr.length)}│  │`);
+        lines.push(`│  └───────────────────────────────────────────────────────────┘  │`);
+        lines.push(`│                                                                 │`);
+    }
+    // Yield positions
+    if (dashboard.yieldPositions && dashboard.yieldPositions.positions.length > 0) {
+        lines.push(`├─────────────────────────────────────────────────────────────────┤`);
+        lines.push(`│                                                                 │`);
+        lines.push(`│  🌾 YIELD POSITIONS                                             │`);
+        lines.push(`│  ┌─────────────┬──────────────┬─────────────┬────────────────┐  │`);
+        lines.push(`│  │ Protocol    │ Asset        │ Deposited   │ APY            │  │`);
+        lines.push(`│  ├─────────────┼──────────────┼─────────────┼────────────────┤  │`);
+        for (const pos of dashboard.yieldPositions.positions.slice(0, 5)) {
+            const protocol = pos.protocol.slice(0, 11).padEnd(11);
+            const asset = `${pos.asset} (${pos.chain.slice(0, 4)})`.slice(0, 12).padEnd(12);
+            const deposited = `$${pos.valueUsd}`.slice(0, 11).padEnd(11);
+            const apy = `${pos.apy.toFixed(2)}%`.padEnd(14);
+            lines.push(`│  │ ${protocol} │ ${asset} │ ${deposited} │ ${apy} │  │`);
+        }
+        lines.push(`│  └─────────────┴──────────────┴─────────────┴────────────────┘  │`);
+        lines.push(`│  Total: $${dashboard.yieldPositions.totalValueUsd} @ ${dashboard.yieldPositions.weightedApy.toFixed(2)}% APY | Earned: +$${dashboard.yieldPositions.lifetimeEarnings}`.slice(0, 63).padEnd(63) + `│`);
+        lines.push(`│                                                                 │`);
+    }
+    lines.push(`└─────────────────────────────────────────────────────────────────┘`);
+    return lines.join('\n');
+}
+// Preferred tokens to swap from for gas (in order of preference)
+const GAS_SWAP_PRIORITY = ["USDC", "USDT", "DAI", "WETH"];
+// Minimum gas buffer - add 30% to estimated gas cost
+const GAS_BUFFER_PERCENT = 30;
+/**
+ * Get native token balance for a chain
+ */
+export async function getNativeBalance(chain) {
+    const session = await getSession();
+    if (!session?.authenticated || !session.address) {
+        throw new Error("Not authenticated");
+    }
+    if (chain === "solana") {
+        // Handle Solana separately
+        const balances = await getBalances("solana");
+        return {
+            balance: balances[0]?.balance || "0",
+            balanceRaw: BigInt(Math.floor(parseFloat(balances[0]?.balance || "0") * 1e9)),
+            symbol: "SOL",
+        };
+    }
+    const config = CHAIN_CONFIG[chain];
+    const symbol = chain === "polygon" ? "MATIC" : "ETH";
+    try {
+        const response = await fetch(config.rpcUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                jsonrpc: "2.0",
+                method: "eth_getBalance",
+                params: [session.address, "latest"],
+                id: 1,
+            }),
+        });
+        const data = (await response.json());
+        const balanceRaw = BigInt(data.result || "0");
+        const balance = (Number(balanceRaw) / 1e18).toFixed(6);
+        return { balance, balanceRaw, symbol };
+    }
+    catch (error) {
+        console.error(`[clara] Error getting native balance on ${chain}:`, error);
+        return { balance: "0", balanceRaw: 0n, symbol };
+    }
+}
+/**
+ * Get current gas price for a chain
+ * Returns gas price in wei and gwei
+ */
+export async function getGasPrice(chain) {
+    if (chain === "solana") {
+        // Solana uses different fee model
+        return { gasPriceWei: 5000n, gasPriceGwei: 0 };
+    }
+    const config = CHAIN_CONFIG[chain];
+    try {
+        const response = await fetch(config.rpcUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                jsonrpc: "2.0",
+                method: "eth_gasPrice",
+                params: [],
+                id: 1,
+            }),
+        });
+        const data = (await response.json());
+        const gasPriceWei = BigInt(data.result || "1000000000"); // Default 1 gwei
+        const gasPriceGwei = Number(gasPriceWei) / 1e9;
+        return { gasPriceWei, gasPriceGwei };
+    }
+    catch (error) {
+        console.error(`[clara] Error getting gas price on ${chain}:`, error);
+        // Default fallback: 30 gwei
+        return { gasPriceWei: 30000000000n, gasPriceGwei: 30 };
+    }
+}
+/**
+ * Check if user has enough gas for a transaction
+ * If not, returns details about which tokens can be swapped for gas
+ */
+export async function checkGasForTransaction(chain, estimatedGasUnits = 100000n) {
+    const session = await getSession();
+    if (!session?.authenticated || !session.address) {
+        throw new Error("Not authenticated");
+    }
+    // Get native balance and gas price
+    const [nativeBalanceResult, gasPriceResult] = await Promise.all([
+        getNativeBalance(chain),
+        getGasPrice(chain),
+    ]);
+    const { balance: nativeBalance, balanceRaw, symbol: nativeSymbol } = nativeBalanceResult;
+    const { gasPriceWei } = gasPriceResult;
+    // Calculate estimated gas cost with buffer
+    const gasUnits = typeof estimatedGasUnits === 'number' ? BigInt(estimatedGasUnits) : estimatedGasUnits;
+    const baseCost = gasUnits * gasPriceWei;
+    const bufferedCost = (baseCost * BigInt(100 + GAS_BUFFER_PERCENT)) / 100n;
+    const estimatedGasCost = (Number(bufferedCost) / 1e18).toFixed(6);
+    // Get ETH price for USD conversion
+    const prices = await fetchPrices();
+    const ethPrice = prices["ethereum"]?.usd || 3000;
+    const estimatedGasUsd = (Number(bufferedCost) / 1e18 * ethPrice).toFixed(2);
+    // Check if user has enough
+    const hasEnoughGas = balanceRaw >= bufferedCost;
+    if (hasEnoughGas) {
+        return {
+            hasEnoughGas: true,
+            nativeBalance,
+            nativeSymbol,
+            estimatedGasCost,
+            estimatedGasUsd,
+        };
+    }
+    // User doesn't have enough gas - find tokens to swap
+    console.error(`[clara] Insufficient gas on ${chain}. Need ${estimatedGasCost} ${nativeSymbol}, have ${nativeBalance}`);
+    // Check balances of preferred tokens
+    const availableForSwap = [];
+    for (const tokenSymbol of GAS_SWAP_PRIORITY) {
+        const tokenInfo = POPULAR_TOKENS[tokenSymbol]?.[chain];
+        if (!tokenInfo)
+            continue;
+        try {
+            const tokenBalance = await getTokenBalance(tokenInfo.address, chain);
+            const balanceNum = parseFloat(tokenBalance.balance);
+            if (balanceNum > 0) {
+                // Get USD value (stablecoins ~$1, WETH ~ethPrice)
+                const priceUsd = STABLE_TOKENS.has(tokenSymbol) ? 1 : ethPrice;
+                const balanceUsd = (balanceNum * priceUsd).toFixed(2);
+                availableForSwap.push({
+                    symbol: tokenSymbol,
+                    balance: tokenBalance.balance,
+                    balanceUsd,
+                });
+            }
+        }
+        catch (error) {
+            console.error(`[clara] Error checking ${tokenSymbol} balance:`, error);
+        }
+    }
+    // Calculate how much gas is needed (what we're short)
+    const shortfall = bufferedCost - balanceRaw;
+    const shortfallNative = (Number(shortfall) / 1e18).toFixed(6);
+    const shortfallUsd = (Number(shortfall) / 1e18 * ethPrice).toFixed(2);
+    // Find best token to swap from
+    let suggestedSwap;
+    if (availableForSwap.length > 0) {
+        // Pick first available token with sufficient balance
+        for (const token of availableForSwap) {
+            const tokenBalanceUsd = parseFloat(token.balanceUsd);
+            const neededUsd = parseFloat(shortfallUsd) * 1.1; // Add 10% buffer for slippage
+            if (tokenBalanceUsd >= neededUsd) {
+                // Calculate amount to swap
+                const priceUsd = STABLE_TOKENS.has(token.symbol) ? 1 : ethPrice;
+                const fromAmount = (neededUsd / priceUsd).toFixed(token.symbol === "WETH" ? 6 : 2);
+                suggestedSwap = {
+                    fromToken: token.symbol,
+                    fromAmount,
+                    fromAmountUsd: neededUsd.toFixed(2),
+                    toAmount: shortfallNative,
+                };
+                // Try to get an actual quote
+                try {
+                    const quote = await getSwapQuote(token.symbol, "ETH", fromAmount, chain);
+                    suggestedSwap.swapQuote = quote;
+                    suggestedSwap.toAmount = quote.toAmount;
+                }
+                catch (error) {
+                    console.error(`[clara] Could not get swap quote:`, error);
+                }
+                break;
+            }
+        }
+    }
+    return {
+        hasEnoughGas: false,
+        nativeBalance,
+        nativeSymbol,
+        estimatedGasCost,
+        estimatedGasUsd,
+        suggestedSwap,
+        availableForSwap,
+    };
+}
+/**
+ * Create a gas plan for a transaction
+ * Automatically includes swap-for-gas step if needed
+ */
+export async function createGasPlan(chain, transactions) {
+    const session = await getSession();
+    if (!session?.authenticated || !session.address) {
+        throw new Error("Not authenticated");
+    }
+    // Estimate gas for all transactions
+    let totalGasUnits = 0n;
+    const txsWithGas = [];
+    for (const tx of transactions) {
+        const gasEstimate = await estimateGas({ to: tx.to, data: tx.data, value: tx.value }, chain);
+        const gasUnits = BigInt(gasEstimate.gasLimit);
+        totalGasUnits += gasUnits;
+        txsWithGas.push({
+            ...tx,
+            estimatedGas: gasEstimate.gasLimit,
+        });
+    }
+    // Check if user has enough gas
+    const gasCheck = await checkGasForTransaction(chain, totalGasUnits);
+    // Get native token symbol
+    const nativeSymbol = chain === "polygon" ? "MATIC" : "ETH";
+    // Build the plan
+    const plan = {
+        transactions: txsWithGas,
+        totalGasCost: {
+            native: gasCheck.estimatedGasCost,
+            symbol: nativeSymbol,
+            usd: gasCheck.estimatedGasUsd,
+        },
+        summary: "",
+    };
+    if (gasCheck.hasEnoughGas) {
+        plan.summary = `Ready to execute ${transactions.length} transaction(s). Gas: ~$${gasCheck.estimatedGasUsd}`;
+    }
+    else if (gasCheck.suggestedSwap?.swapQuote) {
+        // Need to swap for gas first
+        plan.gasSwap = {
+            quote: gasCheck.suggestedSwap.swapQuote,
+            fromToken: gasCheck.suggestedSwap.fromToken,
+            fromAmount: gasCheck.suggestedSwap.fromAmount,
+            toAmount: gasCheck.suggestedSwap.toAmount,
+            description: `Swap ${gasCheck.suggestedSwap.fromAmount} ${gasCheck.suggestedSwap.fromToken} → ${gasCheck.suggestedSwap.toAmount} ${nativeSymbol} for gas`,
+        };
+        plan.netTokenCost = {
+            token: gasCheck.suggestedSwap.fromToken,
+            amount: gasCheck.suggestedSwap.fromAmount,
+            usd: gasCheck.suggestedSwap.fromAmountUsd,
+        };
+        plan.summary = `Insufficient ${nativeSymbol} for gas. Will swap ~$${gasCheck.suggestedSwap.fromAmountUsd} of ${gasCheck.suggestedSwap.fromToken} to cover gas costs.`;
+    }
+    else {
+        // No tokens available to swap
+        const availableTokens = gasCheck.availableForSwap?.map(t => t.symbol).join(", ") || "none";
+        plan.summary = `Insufficient ${nativeSymbol} for gas. Available tokens to swap: ${availableTokens}. Please add more funds.`;
+    }
+    return plan;
+}
+/**
+ * Execute a gas plan (including any necessary swap-for-gas)
+ * Returns transaction hashes for all executed transactions
+ */
+export async function executeGasPlan(plan, chain) {
+    const results = [];
+    // Step 1: Execute gas swap if needed
+    if (plan.gasSwap && plan.gasSwap.quote) {
+        console.error(`[clara] Executing gas swap: ${plan.gasSwap.description}`);
+        try {
+            const swapResult = await executeSwap(plan.gasSwap.quote, chain);
+            results.push({
+                description: plan.gasSwap.description,
+                txHash: swapResult.txHash,
+                status: "completed",
+            });
+            // Wait a moment for the swap to settle
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+        catch (error) {
+            console.error(`[clara] Gas swap failed:`, error);
+            results.push({
+                description: plan.gasSwap.description,
+                txHash: "",
+                status: "failed",
+            });
+            throw new Error(`Gas swap failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+    // Step 2: Execute main transactions
+    for (const tx of plan.transactions) {
+        console.error(`[clara] Executing: ${tx.description}`);
+        try {
+            const txResult = await sendTransaction(tx.to, tx.value || "0", chain, undefined, tx.data);
+            results.push({
+                description: tx.description,
+                txHash: txResult.txHash,
+                status: "pending",
+            });
+        }
+        catch (error) {
+            console.error(`[clara] Transaction failed:`, error);
+            results.push({
+                description: tx.description,
+                txHash: "",
+                status: "failed",
+            });
+        }
+    }
+    return results;
+}
+/**
+ * Quick helper: Ensure gas is available for a simple transaction
+ * Returns true if ready, or details about what's needed
+ */
+export async function ensureGas(chain, estimatedGasUnits = 100000) {
+    const gasCheck = await checkGasForTransaction(chain, BigInt(estimatedGasUnits));
+    if (gasCheck.hasEnoughGas) {
+        return { ready: true, message: "Gas available" };
+    }
+    if (gasCheck.suggestedSwap?.swapQuote) {
+        return {
+            ready: false,
+            message: `Need to swap ${gasCheck.suggestedSwap.fromAmount} ${gasCheck.suggestedSwap.fromToken} for gas`,
+            swapNeeded: gasCheck.suggestedSwap.swapQuote,
+        };
+    }
+    return {
+        ready: false,
+        message: `Insufficient gas and no tokens available to swap. Add ${gasCheck.nativeSymbol} or stablecoins.`,
+    };
+}
+// Re-export Solana module for direct access
+export { getSolanaAssets, getSolanaTransactions, isHeliusAvailable, } from "./solana.js";
 //# sourceMappingURL=client.js.map

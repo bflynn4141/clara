@@ -31,7 +31,7 @@ Supported tokens by symbol: USDC, USDT, DAI, WETH, WBTC`,
                 return {
                     content: [{
                             type: "text",
-                            text: `❌ No wallet configured. Run wallet_setup first.`
+                            text: `❌ No wallet configured.\n\nRun \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.`
                         }]
                 };
             }

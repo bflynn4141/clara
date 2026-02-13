@@ -7,7 +7,10 @@ import { getBalances } from "../para/client.js";
 const SUPPORTED_CHAINS = ["ethereum", "base", "arbitrum", "optimism", "polygon", "solana"];
 export function registerBalanceTool(server) {
     server.registerTool("wallet_get_balance", {
-        description: "Get token balances for your wallet on a specific chain. Shows native token and major stablecoins.",
+        description: `Get token balances for your wallet on a specific chain.
+
+EVM chains: Shows native token (ETH/MATIC) and major stablecoins (USDC, USDT, DAI).
+Solana: Shows SOL and all SPL tokens with USD values (requires HELIUS_API_KEY for full token list).`,
         inputSchema: {
             chain: z.enum(SUPPORTED_CHAINS)
                 .default("base")
@@ -25,7 +28,7 @@ export function registerBalanceTool(server) {
                 return {
                     content: [{
                             type: "text",
-                            text: `❌ No wallet configured. Run wallet_setup first.`
+                            text: `❌ No wallet configured.\n\nRun \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.`
                         }]
                 };
             }

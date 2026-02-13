@@ -1,19 +1,26 @@
 /**
  * wallet_portfolio - View portfolio across all chains
  *
- * Shows native token balances, USD values, and 24h changes
+ * Shows native token balances AND popular ERC-20s (USDC, USDT, DAI)
  */
 import { z } from "zod";
 import { getSession } from "../storage/session.js";
-import { getPortfolio, formatUsd, formatChange, reverseResolveEns } from "../para/client.js";
+import { getPortfolioFast, formatUsd, formatChange, reverseResolveEns, getTokenBalance, POPULAR_TOKENS, getSolanaAssets, } from "../para/client.js";
+// Popular stablecoins to always check (Multicall can be unreliable)
+const STABLECOINS_TO_CHECK = ["USDC", "USDT", "DAI"];
+const EVM_CHAINS = ["base", "arbitrum", "optimism", "ethereum", "polygon"];
 export function registerPortfolioTool(server) {
     server.registerTool("wallet_portfolio", {
-        description: "View your portfolio across all chains. Shows native token balances, current prices, USD values, and 24h price changes.",
+        description: "View your portfolio across all chains (EVM + Solana). Shows native token balances, stablecoins, SPL tokens, prices, USD values, and 24h price changes.",
         inputSchema: {
             showEmpty: z.boolean()
                 .optional()
                 .default(false)
                 .describe("Include chains with zero balance (default: false)"),
+            refresh: z.boolean()
+                .optional()
+                .default(true)
+                .describe("Force fresh data fetch (default: true). Data is always fetched fresh from blockchain."),
         },
     }, async (args) => {
         const showEmpty = args.showEmpty ?? false;
@@ -23,11 +30,56 @@ export function registerPortfolioTool(server) {
                 return {
                     content: [{
                             type: "text",
-                            text: `❌ No wallet configured. Run wallet_setup first.`
+                            text: `❌ No wallet configured.\n\nRun \`wallet_setup\` to create one — it takes 5 seconds, no seed phrase needed.`
                         }]
                 };
             }
-            const portfolio = await getPortfolio();
+            const portfolio = await getPortfolioFast();
+            // SAFETY NET: Explicitly check stablecoins since Multicall can be unreliable
+            // This ensures USDC/USDT/DAI always show up if present
+            const stablecoinChecks = await checkStablecoins(session.address);
+            // Merge stablecoin results with portfolio (avoiding duplicates)
+            const existingKeys = new Set(portfolio.items.map(i => `${i.chain}:${i.symbol}`));
+            for (const item of stablecoinChecks) {
+                const key = `${item.chain}:${item.symbol}`;
+                if (!existingKeys.has(key) && parseFloat(item.balance) > 0) {
+                    portfolio.items.push(item);
+                    portfolio.totalValueUsd += item.valueUsd ?? 0;
+                }
+            }
+            // Add Solana balances if wallet has Solana address
+            if (session.solanaAddress) {
+                try {
+                    const solanaPortfolio = await getSolanaAssets(session.solanaAddress);
+                    // Add native SOL
+                    if (parseFloat(solanaPortfolio.nativeBalance.balance) > 0) {
+                        portfolio.items.push({
+                            chain: "solana",
+                            symbol: "SOL",
+                            balance: solanaPortfolio.nativeBalance.balance,
+                            priceUsd: solanaPortfolio.nativeBalance.priceUsd,
+                            valueUsd: solanaPortfolio.nativeBalance.valueUsd,
+                            change24h: null,
+                        });
+                        portfolio.totalValueUsd += solanaPortfolio.nativeBalance.valueUsd ?? 0;
+                    }
+                    // Add SPL tokens
+                    for (const token of solanaPortfolio.tokens) {
+                        portfolio.items.push({
+                            chain: "solana",
+                            symbol: token.symbol,
+                            balance: token.balance,
+                            priceUsd: token.priceUsd,
+                            valueUsd: token.valueUsd,
+                            change24h: null,
+                        });
+                        portfolio.totalValueUsd += token.valueUsd ?? 0;
+                    }
+                }
+                catch (error) {
+                    console.error("[clara] Failed to fetch Solana portfolio:", error);
+                }
+            }
             // Filter out zero balances unless showEmpty is true
             const items = showEmpty
                 ? portfolio.items
@@ -77,14 +129,36 @@ export function registerPortfolioTool(server) {
                 footer.push(`│  24h Change: ${changeEmoji} ${formatChange(portfolio.totalChange24h).padEnd(43)}│`);
             }
             footer.push(`└─────────────────────────────────────────────────────────────┘`);
-            // Add last updated timestamp
-            const updatedTime = new Date(portfolio.lastUpdated).toLocaleTimeString();
+            // Add timestamp with relative time indicator
+            const now = Date.now();
+            const fetchTime = new Date(portfolio.lastUpdated).getTime();
+            const ageSeconds = Math.floor((now - fetchTime) / 1000);
+            const timeStr = new Date(fetchTime).toLocaleTimeString();
+            // Format relative age
+            let ageStr;
+            let freshIndicator;
+            if (ageSeconds < 5) {
+                ageStr = "just now";
+                freshIndicator = "🟢"; // Fresh
+            }
+            else if (ageSeconds < 60) {
+                ageStr = `${ageSeconds}s ago`;
+                freshIndicator = "🟢"; // Fresh
+            }
+            else if (ageSeconds < 300) {
+                ageStr = `${Math.floor(ageSeconds / 60)}m ago`;
+                freshIndicator = "🟡"; // Slightly stale
+            }
+            else {
+                ageStr = `${Math.floor(ageSeconds / 60)}m ago`;
+                freshIndicator = "🟠"; // Stale
+            }
             const output = [
                 ...header,
                 ...chainRows,
                 ...footer,
                 ``,
-                `Last updated: ${updatedTime}`,
+                `${freshIndicator} Last updated: ${timeStr} (${ageStr})`,
             ].join("\n");
             return {
                 content: [{
@@ -103,5 +177,45 @@ export function registerPortfolioTool(server) {
             };
         }
     });
+}
+/**
+ * Explicitly check stablecoin balances across chains
+ * This is a safety net since Multicall3 can be unreliable on some RPCs
+ */
+async function checkStablecoins(address) {
+    const results = [];
+    // Check all stablecoins across all EVM chains in parallel
+    const checks = EVM_CHAINS.flatMap(chain => STABLECOINS_TO_CHECK.map(async (token) => {
+        try {
+            // Resolve symbol to token address using POPULAR_TOKENS
+            const tokenInfo = POPULAR_TOKENS[token]?.[chain];
+            if (!tokenInfo) {
+                // Token not available on this chain
+                return null;
+            }
+            const balance = await getTokenBalance(tokenInfo.address, chain, address);
+            const balanceNum = parseFloat(balance.balance);
+            if (balanceNum > 0) {
+                return {
+                    chain,
+                    symbol: token,
+                    balance: balance.balance,
+                    priceUsd: 1.0, // Stablecoins ≈ $1
+                    valueUsd: balanceNum,
+                    change24h: null,
+                };
+            }
+        }
+        catch {
+            // Token might not exist on this chain or RPC error, ignore
+        }
+        return null;
+    }));
+    const settled = await Promise.all(checks);
+    for (const item of settled) {
+        if (item)
+            results.push(item);
+    }
+    return results;
 }
 //# sourceMappingURL=portfolio.js.map

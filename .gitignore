@@ -3,3 +3,16 @@ node_modules/
 *.log
 .env
 .vercel
+# Build artifacts
+*.js.map
+*.d.ts
+*.d.ts.map
+src/**/*.js
+src/**/*.d.ts
+src/**/*.d.ts.map
+scripts/**/*.js
+scripts/**/*.d.ts
+scripts/**/*.d.ts.map
+video/**/*.js
+video/**/*.d.ts
+video/**/*.d.ts.map

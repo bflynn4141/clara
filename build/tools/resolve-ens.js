@@ -3,6 +3,7 @@
  */
 import { z } from "zod";
 import { resolveEnsName, reverseResolveEns, isEnsName } from "../para/client.js";
+import { isValidEvmAddress } from "../utils/validators.js";
 export function registerResolveEnsTool(server) {
     server.registerTool("wallet_resolve_ens", {
         description: "Resolve an ENS name (like vitalik.eth) to an Ethereum address, or look up the ENS name for an address. Works with .eth, .xyz, .com, and other ENS-supported domains.",
@@ -22,7 +23,7 @@ export function registerResolveEnsTool(server) {
         }
         try {
             // Determine if this is a forward or reverse lookup
-            const isAddress = input.startsWith("0x") && input.length === 42;
+            const isAddress = isValidEvmAddress(input);
             if (isAddress) {
                 // Reverse lookup: address -> ENS name
                 const ensName = await reverseResolveEns(input);
@@ -48,6 +49,24 @@ export function registerResolveEnsTool(server) {
                             }]
                     };
                 }
+            }
+            // Catch malformed addresses: starts with 0x but isn't valid
+            if (input.startsWith("0x") && !isAddress) {
+                const hexPart = input.slice(2);
+                const issues = [];
+                if (hexPart.length !== 40)
+                    issues.push(`has ${input.length} characters (expected 42)`);
+                if (!/^[0-9a-fA-F]*$/.test(hexPart))
+                    issues.push("contains non-hex characters");
+                return {
+                    content: [{
+                            type: "text",
+                            text: `❌ Invalid Ethereum address: "${input}"\n\n` +
+                                `Issues: ${issues.join(", ")}\n\n` +
+                                `Ethereum addresses are 42 characters: 0x followed by 40 hex digits (0-9, a-f).\n` +
+                                `Example: 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045`
+                        }]
+                };
             }
             // Forward lookup: ENS name -> address
             if (!isEnsName(input)) {
