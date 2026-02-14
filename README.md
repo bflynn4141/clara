@@ -249,6 +249,32 @@ One wallet setup creates both an EVM address (works across all EVM chains) and a
 
 ---
 
+## References & Standards
+
+Clara is built on established protocols and security research:
+
+**Payment Standards**
+- [x402 Payment Protocol](https://x402.org) — HTTP status code for payment-required responses, enabling seamless AI-to-AI transactions
+
+**Identity & Agent Standards**
+- [ERC-8004: Agent Identity Token](https://github.com/ethereum/ERCs/pull/8004) — Standard for on-chain agent registration and reputation
+
+**Security Infrastructure**
+- [Para MPC Security](https://docs.getpara.com/security) — Multi-party computation architecture with distributed key shares
+- [Lit Protocol](https://litprotocol.com) — Underlying threshold cryptography for key management
+
+**Integration Standards**
+- [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) — Anthropic's open standard for AI tool integration
+- [ERC-20 Token Standard](https://eips.ethereum.org/EIPS/eip-20) — Fungible token interface for transfers and approvals
+- [ERC-721/1155 NFT Standards](https://eips.ethereum.org/EIPS/eip-721) — Non-fungible token support (coming soon)
+
+**DeFi Protocols**
+- [Aave v3](https://docs.aave.com) — Lending protocol for yield earning
+- [Li.Fi DEX Aggregation](https://li.fi) — Cross-chain swap routing
+- [DeFiLlama API](https://defillama.com/api) — Yield discovery and APY data
+
+---
+
 ## Credits
 
 - [Para](https://getpara.com) — MPC wallet infrastructure
